@@ -31,7 +31,11 @@ teardown_loop() {
 cleanup() { teardown_loop; rm -rf "$T"; }
 trap cleanup EXIT HUP INT TERM
 
-fail() { echo "ÉCHEC [$PART] : $*" >&2; cat "$T/err" >&2 2>/dev/null || true; exit 1; }
+fail() {
+    echo "ÉCHEC [$PART] : $*" >&2; cat "$T/err" >&2 2>/dev/null || true
+    echo "--- derniers messages du noyau :" >&2; dmesg 2>/dev/null | tail -25 >&2 || true
+    exit 1
+}
 run() { # run <stdin> <exit attendu> <args…>
     input=$1; wanted=$2; shift 2
     set +e; printf '%s\n' "$input" | "$BIN" "$@" >"$T/out" 2>"$T/err"; got=$?; set -e
@@ -74,7 +78,8 @@ if modprobe nvmet 2>/dev/null && modprobe nvme-loop 2>/dev/null && [ -d /sys/ker
     echo "  - smart ($DEV)"
     run "" 0 "$DEV" --smart
     grep -q 'Type      : SSD NVMe' "$T/out" || fail "fiche NVMe absente"
-    dd if=/dev/urandom of="$DEV" bs=1M count=64 oflag=direct status=none
+    lsblk -o NAME,SIZE,TYPE,TRAN,MODEL "$DEV" "$LOOPDEV" 2>/dev/null || true
+    dd if=/dev/urandom of="$DEV" bs=1M count=64 oflag=direct status=none 2>"$T/err" || fail "écriture sur $DEV impossible"
     before=$(md5sum <"$DEV")
     echo "  - zero refusé : SSD NVMe reconnu (le noyau le dit rotatif : $(cat "/sys/block/${DEV#/dev/}/queue/rotational"))"
     run "OUI" 1 "$DEV" --zero
