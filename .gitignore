@@ -1,6 +1,6 @@
-# Binaire compilé (make)
+# Compiled binary (make)
 /diskmedic
-# Archives de release : publiées sur la page Releases de GitHub, pas dans le dépôt
+# Release archives: published on the GitHub Releases page, not in the repository
 /dist/
-# Journaux créés par le mode multi-disques
+# Logs created by the multi-disk mode
 diskmedic-[0-9]*-[0-9]*/

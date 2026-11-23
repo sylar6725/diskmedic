@@ -1,13 +1,13 @@
 #!/bin/sh
-# Tests par format de secteur : 512n (512/512), 512e (512 logique / 4096 physique) et
-# 4Kn (4096/4096), sur des disques SCSI virtuels en mémoire (module noyau scsi_debug).
-# Ne touche jamais aux disques réels. Nécessite root et scsi_debug; sinon : SKIP.
+# Tests per sector format: 512n (512/512), 512e (512 logical / 4096 physical) and
+# 4Kn (4096/4096), on virtual in-memory SCSI disks (scsi_debug kernel module).
+# Never touches real disks. Needs root and scsi_debug; otherwise: SKIP.
 set -eu
 if [ "$(id -u)" -ne 0 ] || ! modprobe -n scsi_debug 2>/dev/null; then
-    echo "SKIP : tests formats de secteur (root + module scsi_debug requis)"; exit 0
+    echo "SKIP: sector format tests (root + scsi_debug module required)"; exit 0
 fi
 if grep -q '^scsi_debug ' /proc/modules; then
-    echo "SKIP : scsi_debug est déjà chargé par autre chose"; exit 0
+    echo "SKIP: scsi_debug is already loaded by something else"; exit 0
 fi
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 T=$(mktemp -d)
@@ -20,7 +20,7 @@ unload() {
     command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
     i=0
     while ! rmmod scsi_debug 2>/dev/null; do
-        i=$((i + 1)); [ "$i" -ge 20 ] && { echo "impossible de décharger scsi_debug" >&2; return 1; }
+        i=$((i + 1)); [ "$i" -ge 20 ] && { echo "cannot unload scsi_debug" >&2; return 1; }
         sleep 0.5
     done
     LOADED=0
@@ -28,13 +28,13 @@ unload() {
 cleanup() { unload || true; rm -rf "$T"; }
 trap cleanup EXIT HUP INT TERM
 
-fail() { echo "ÉCHEC [$FMT] : $*" >&2; cat "$T/err" >&2 2>/dev/null || true; exit 1; }
-run() { # run <stdin> <exit attendu> <args…>
+fail() { echo "FAILED [$FMT]: $*" >&2; cat "$T/err" >&2 2>/dev/null || true; exit 1; }
+run() { # run <stdin> <expected exit> <args…>
     input=$1; wanted=$2; shift 2
     set +e; printf '%s\n' "$input" | "$BIN" "$@" >"$T/out" 2>"$T/err"; got=$?; set -e
-    [ "$got" -eq "$wanted" ] || fail "exit $got au lieu de $wanted pour : $*"
+    [ "$got" -eq "$wanted" ] || fail "exit $got instead of $wanted for: $*"
 }
-load() { # load <taille secteur logique> <exposant physique> [<LBA en erreur> [<nombre>]]
+load() { # load <logical sector size> <physical exponent> [<failing LBA> [<count>]]
     if [ $# -ge 3 ]; then
         modprobe scsi_debug dev_size_mb=64 sector_size="$1" physblk_exp="$2" opts=2 \
             medium_error_start="$3" medium_error_count="${4:-1}"
@@ -51,30 +51,30 @@ load() { # load <taille secteur logique> <exposant physique> [<LBA en erreur> [<
         [ -n "$DEV" ] && [ -b "$DEV" ] && break
         sleep 0.5
     done
-    [ -n "$DEV" ] || fail "disque scsi_debug introuvable"
+    [ -n "$DEV" ] || fail "scsi_debug disk not found"
     LS=$(cat "/sys/block/${DEV#/dev/}/queue/logical_block_size")
     PS=$(cat "/sys/block/${DEV#/dev/}/queue/physical_block_size")
-    [ "$LS" -eq "$1" ] || fail "secteur logique $LS au lieu de $1"
-    [ "$PS" -eq $(( $1 << $2 )) ] || fail "secteur physique $PS au lieu de $(( $1 << $2 ))"
+    [ "$LS" -eq "$1" ] || fail "logical sector $LS instead of $1"
+    [ "$PS" -eq $(( $1 << $2 )) ] || fail "physical sector $PS instead of $(( $1 << $2 ))"
 }
-# Empreinte de tous les secteurs logiques sauf [<premier>, +<nombre>) (les secteurs illisibles).
-md5_except() { # md5_except <premier LBA exclu> [<nombre>]
+# Checksum of all logical sectors except [<first>, +<count>) (the unreadable sectors).
+md5_except() { # md5_except <first excluded LBA> [<count>]
     total=$(( $(blockdev --getsize64 "$DEV") / LS )); cnt=${2:-1}
-    # Lectures directes par blocs de 1 Mio, bornées en octets pour ne jamais toucher les secteurs exclus.
+    # Direct reads in 1 MiB blocks, bounded in bytes so the excluded sectors are never touched.
     { dd if="$DEV" bs=1M iflag=direct,count_bytes count=$(( $1 * LS )) status=none
       dd if="$DEV" bs=1M iflag=direct,skip_bytes,count_bytes skip=$(( ($1 + cnt) * LS )) \
          count=$(( (total - $1 - cnt) * LS )) status=none; } | md5sum
 }
-# Nombre de lectures en échec signalées par le noyau pour $DEV depuis la marque posée par kmsg_mark.
+# Number of failed reads reported by the kernel for $DEV since the mark set by kmsg_mark.
 kmsg_mark() { MARK="diskmedic-mark-$$-$1"; echo "$MARK" >/dev/kmsg; }
 kmsg_read_errors() {
     dmesg | sed -n "/$MARK/,\$p" | grep -c "critical medium error, dev ${DEV#/dev/}, sector .* op 0x0:(READ)" || true
 }
 nonzero() { tr -d '\000' <"$DEV" | wc -c | tr -d ' '; }
-# Copie $T/rnd vers $DEV sur [premier secteur, +nombre), uniquement en O_DIRECT : une écriture
-# tamponnée partielle provoquerait une lecture-modification-écriture de la page de 4 Kio,
-# qui échoue si cette page contient le secteur illisible.
-wr_range() { # wr_range <premier secteur> <nombre de secteurs>
+# Copies $T/rnd to $DEV over [first sector, +count), with O_DIRECT only: a partial buffered
+# write would cause a read-modify-write of the 4 KiB page, which fails if that page
+# contains the unreadable sector.
+wr_range() { # wr_range <first sector> <number of sectors>
     s=$1; n=$2; per=$(( 1048576 / LS ))
     head=$(( (per - s % per) % per )); [ "$head" -gt "$n" ] && head=$n
     [ "$head" -gt 0 ] && dd if="$T/rnd" of="$DEV" bs="$LS" skip="$s" seek="$s" count="$head" oflag=direct status=none
@@ -87,147 +87,147 @@ wr_range() { # wr_range <premier secteur> <nombre de secteurs>
 
 for spec in "512n 512 0" "512e 512 3" "4Kn 4096 0"; do
     set -- $spec; FMT=$1; SS=$2; EXP=$3
-    echo "== $FMT (logique $SS o, physique $(( SS << EXP )) o)"
+    echo "== $FMT (logical $SS B, physical $(( SS << EXP )) B)"
 
-    # Disque sain.
+    # Healthy disk.
     load "$SS" "$EXP"
     dd if=/dev/urandom of="$DEV" bs=1M count=64 oflag=direct status=none
-    echo "  - smart (SCSI : INQUIRY + pages LOG SENSE)"
+    echo "  - smart (SCSI: INQUIRY + LOG SENSE pages)"
     run "" 0 "$DEV" --smart
-    grep -q "━━ Linux scsi_debug ━━" "$T/out" || fail "fiche SCSI absente"
-    grep -q "Secteurs  : $FMT (" "$T/out" || fail "format $FMT non reconnu"
-    grep -q 'Santé (avis du firmware) : OK' "$T/out" || fail "page 2Fh non décodée"
-    grep -q 'Température  *[0-9][0-9]* °C (max. [0-9]* °C)' "$T/out" || fail "page 0Dh non décodée"
+    grep -q "━━ Linux scsi_debug ━━" "$T/out" || fail "SCSI identity missing"
+    grep -q "Sectors   : $FMT (" "$T/out" || fail "format $FMT not recognized"
+    grep -q 'Health (firmware assessment): OK' "$T/out" || fail "page 2Fh not decoded"
+    grep -q 'Temperature  *[0-9][0-9]* °C (max. [0-9]* °C)' "$T/out" || fail "page 0Dh not decoded"
     echo "  - verify";      run "" 0 "$DEV" --verify
     echo "  - scan-slow";   run "" 0 "$DEV" --scan-slow
-    grep -q 'Note : SSD SAS/SCSI' "$T/err" || fail "note SSD absente du scan lent"
-    # scsi_debug se présente comme un SSD (VPD B1h) : zéros et réparation refusés sans --force.
-    echo "  - SSD : zero et slow-repair refusés sans --force, données intactes"
+    grep -q 'Note (SAS/SCSI SSD' "$T/err" || fail "SSD note missing from the slow scan"
+    # scsi_debug presents itself as an SSD (VPD B1h): zeros and repair refused without --force.
+    echo "  - SSD: zero and slow-repair refused without --force, data intact"
     before=$(md5sum <"$DEV")
-    run "OUI" 1 "$DEV" --zero;        grep -q 'Écriture zéro déconseillée' "$T/err" || fail "refus SSD de --zero absent"
-    run "OUI" 1 "$DEV" --slow-repair; grep -q 'Réparation lente déconseillée' "$T/err" || fail "refus SSD de --slow-repair absent"
-    [ "$before" = "$(md5sum <"$DEV")" ] || fail "un refus a modifié les données"
-    echo "  - trim sans UNMAP : refusé, données intactes"
-    run "OUI" 1 "$DEV" --trim; grep -q 'ne prend pas en charge TRIM' "$T/err" || fail "refus TRIM absent"
-    [ "$before" = "$(md5sum <"$DEV")" ] || fail "TRIM refusé a modifié les données"
-    echo "  - slow-repair --force : données intactes"
-    run "OUI" 0 "$DEV" --slow-repair --force
-    [ "$before" = "$(md5sum <"$DEV")" ] || fail "slow-repair a modifié les données"
-    echo "  - zero --force";  run "OUI" 0 "$DEV" --zero --force
-    [ "$(nonzero)" -eq 0 ] || fail "octets non nuls après --zero"
+    run "YES" 1 "$DEV" --zero;        grep -q 'Zero-fill not recommended' "$T/err" || fail "SSD refusal of --zero missing"
+    run "YES" 1 "$DEV" --slow-repair; grep -q 'Slow-block repair not recommended' "$T/err" || fail "SSD refusal of --slow-repair missing"
+    [ "$before" = "$(md5sum <"$DEV")" ] || fail "a refusal modified the data"
+    echo "  - trim without UNMAP: refused, data intact"
+    run "YES" 1 "$DEV" --trim; grep -q 'does not support TRIM' "$T/err" || fail "TRIM refusal missing"
+    [ "$before" = "$(md5sum <"$DEV")" ] || fail "refused TRIM modified the data"
+    echo "  - slow-repair --force: data intact"
+    run "YES" 0 "$DEV" --slow-repair --force
+    [ "$before" = "$(md5sum <"$DEV")" ] || fail "slow-repair modified the data"
+    echo "  - zero --force";  run "YES" 0 "$DEV" --zero --force
+    [ "$(nonzero)" -eq 0 ] || fail "non-zero bytes after --zero"
     unload
 
-    # TRIM : disque avec UNMAP (lbpu=1), lecture à zéro des blocs libérés (lbprz=1).
+    # TRIM: disk with UNMAP (lbpu=1), freed blocks read back as zeros (lbprz=1).
     SD_EXTRA="lbpu=1 lbprz=1"; load "$SS" "$EXP"; SD_EXTRA=""
     dd if=/dev/urandom of="$DEV" bs=1M count=64 oflag=direct status=none
-    echo "  - trim : refusé sans OUI, puis disque entier libéré"
-    before=$(md5sum <"$DEV"); run "non" 2 "$DEV" --trim
-    [ "$before" = "$(md5sum <"$DEV")" ] || fail "trim non confirmé a modifié les données"
-    run "OUI" 0 "$DEV" --trim
-    grep -q 'tout est à zéro' "$T/err" || fail "relecture à zéro après TRIM non signalée"
-    [ "$(nonzero)" -eq 0 ] || fail "octets non nuls après --trim"
+    echo "  - trim: refused without YES, then the whole disk is freed"
+    before=$(md5sum <"$DEV"); run "no" 2 "$DEV" --trim
+    [ "$before" = "$(md5sum <"$DEV")" ] || fail "unconfirmed trim modified the data"
+    run "YES" 0 "$DEV" --trim
+    grep -q 'everything is zero' "$T/err" || fail "zero read-back after TRIM not reported"
+    [ "$(nonzero)" -eq 0 ] || fail "non-zero bytes after --trim"
     unload
 
-    # Un secteur logique illisible au milieu d'un secteur physique du bloc 5.
+    # One unreadable logical sector in the middle of a physical sector of block 5.
     BAD=$(( 5 * 1048576 / SS + 3 ))
     load "$SS" "$EXP" "$BAD"
     dd if=/dev/urandom of="$T/rnd" bs=1M count=64 status=none
     wr_range 0 "$BAD"
     wr_range $(( BAD + 1 )) $(( 64 * 1048576 / SS - BAD - 1 ))
     rm -f "$T/rnd"
-    echo "  - verify : LBA $BAD signalé"
+    echo "  - verify: LBA $BAD reported"
     run "" 1 "$DEV" --verify --log "$T/v.csv"
-    grep -q "LBA $BAD " "$T/err" || fail "LBA $BAD non signalé"
-    grep -q '1 secteur(s) illisible(s)' "$T/err" || fail "1 secteur illisible attendu"
-    grep -q "\"$BAD\",\"DEFECTUEUX" "$T/v.csv" || fail "LBA $BAD absent du journal"
-    echo "  - slow-repair : un seul secteur physique réécrit, voisins conservés"
+    grep -q "LBA $BAD " "$T/err" || fail "LBA $BAD not reported"
+    grep -q '1 unreadable sector(s)' "$T/err" || fail "1 unreadable sector expected"
+    grep -q "\"$BAD\",\"DEFECTIVE" "$T/v.csv" || fail "LBA $BAD missing from the log"
+    echo "  - slow-repair: a single physical sector rewritten, neighbours kept"
     before=$(md5_except "$BAD")
-    run "OUI" 1 "$DEV" --slow-repair --force   # scsi_debug garde le secteur en erreur : vérification en échec attendue
-    grep -q '(1 secteur(s) physique(s) réécrit(s)' "$T/out" || fail "un seul secteur physique réécrit attendu"
-    [ "$before" = "$(md5_except "$BAD")" ] || fail "des secteurs lisibles ont été modifiés"
+    run "YES" 1 "$DEV" --slow-repair --force   # scsi_debug keeps the sector failing: verification failure expected
+    grep -q '(1 physical sector(s) rewritten' "$T/out" || fail "a single rewritten physical sector expected"
+    [ "$before" = "$(md5_except "$BAD")" ] || fail "readable sectors were modified"
     unload
 done
 
-# Cas réaliste 512e : un secteur PHYSIQUE entier est perdu, donc ses 8 secteurs logiques.
-FMT="512e physique perdu"; echo "== $FMT"
+# Realistic 512e case: a whole PHYSICAL sector is lost, hence its 8 logical sectors.
+FMT="512e physical sector lost"; echo "== $FMT"
 BAD=10240
 load 512 3 "$BAD" 8
 dd if=/dev/urandom of="$T/rnd" bs=1M count=64 status=none
 wr_range 0 "$BAD"
 wr_range $(( BAD + 8 )) $(( 64 * 2048 - BAD - 8 ))
 rm -f "$T/rnd"
-echo "  - verify : 8 LBA signalés avec au plus 4 lectures en échec (au lieu de 9)"
-sleep 6   # laisse se vider la limite de débit des messages noyau
+echo "  - verify: 8 LBAs reported with at most 4 failed reads (instead of 9)"
+sleep 6   # lets the kernel message rate limit drain
 kmsg_mark verify
 run "" 1 "$DEV" --verify --log "$T/p.csv"
-grep -q '8 secteur(s) illisible(s)' "$T/err" || fail "8 secteurs illisibles attendus"
+grep -q '8 unreadable sector(s)' "$T/err" || fail "8 unreadable sectors expected"
 for l in 10240 10241 10242 10243 10244 10245 10246 10247; do
-    grep -q "\"$l\",\"DEFECTUEUX" "$T/p.csv" || fail "LBA $l absent du journal"
+    grep -q "\"$l\",\"DEFECTIVE" "$T/p.csv" || fail "LBA $l missing from the log"
 done
 nerr=$(kmsg_read_errors)
-[ "$nerr" -le 4 ] || fail "$nerr lectures en échec (4 au plus attendues)"
-echo "    ($nerr lectures en échec)"
-echo "  - slow-repair : un seul secteur physique réécrit, reste intact"
+[ "$nerr" -le 4 ] || fail "$nerr failed reads (at most 4 expected)"
+echo "    ($nerr failed reads)"
+echo "  - slow-repair: a single physical sector rewritten, the rest intact"
 before=$(md5_except "$BAD" 8)
-run "OUI" 1 "$DEV" --slow-repair --force
-grep -q '(1 secteur(s) physique(s) réécrit(s)' "$T/out" || fail "un seul secteur physique réécrit attendu"
-grep -q 'secteurs illisibles : 8' "$T/out" || fail "8 secteurs illisibles attendus au scan"
-[ "$before" = "$(md5_except "$BAD" 8)" ] || fail "des secteurs lisibles ont été modifiés"
+run "YES" 1 "$DEV" --slow-repair --force
+grep -q '(1 physical sector(s) rewritten' "$T/out" || fail "a single rewritten physical sector expected"
+grep -q 'unreadable sectors: 8' "$T/out" || fail "8 unreadable sectors expected in the scan"
+[ "$before" = "$(md5_except "$BAD" 8)" ] || fail "readable sectors were modified"
 unload
 
-# Sélection multi-disques : deux disques vérifiés en parallèle (pseudo-terminal fourni par script).
-# SÉCURITÉ : seuls les disques scsi_debug doivent être sélectionnés. Le test ne se fie pas à la
-# position des disques dans la liste (l'ordre du menu n'est pas l'ordre alphabétique : sdX avant
-# nvmeXnY) : il lit la ligne sous le curseur et ne coche que celles qui affichent « scsi_debug ».
-# Avant Entrée, l'écran doit indiquer exactement 2 disques sélectionnés; avant OUI, chaque disque
-# visé doit être un scsi_debug. Sinon le menu est quitté sans rien lancer, et le test échoue.
-# Chaque touche n'est envoyée qu'une fois l'écran attendu affiché (le démarrage peut être lent),
-# et le pseudo-terminal est borné dans le temps : un blocage fait échouer le test sans le figer.
-wait_screen() { # wait_screen <texte> <nombre de demi-secondes au plus>
+# Multi-disk selection: two disks verified in parallel (pseudo-terminal provided by script).
+# SAFETY: only the scsi_debug disks may be selected. The test does not rely on the position
+# of the disks in the list (the menu order is not alphabetical: sdX before nvmeXnY): it reads
+# the line under the cursor and only selects lines that show "scsi_debug".
+# Before Enter, the screen must show exactly 2 selected disks; before YES, every target disk
+# must be a scsi_debug disk. Otherwise the menu is left without starting anything, and the test fails.
+# Each key is only sent once the expected screen is shown (start-up can be slow), and the
+# pseudo-terminal is bounded in time: a hang makes the test fail instead of freezing it.
+wait_screen() { # wait_screen <text> <maximum number of half-seconds>
     j=0; while ! grep -aq "$1" "$T/ts" 2>/dev/null && [ "$j" -lt "$2" ]; do sleep 0.5; j=$((j + 1)); done
 }
 cursor_frames() { grep -ac '> \[.\] /dev/' "$T/ts" 2>/dev/null || true; }
-press() { # press <touche> : envoie une touche et attend que le menu soit redessiné
+press() { # press <key>: sends a key and waits for the menu to be redrawn
     n=$(cursor_frames); printf "$1"; j=0
     while [ "$(cursor_frames)" -le "$n" ] && [ "$j" -lt 40 ]; do sleep 0.25; j=$((j + 1)); done
 }
 abort_tui() { echo "$1" >"$T/abort"; printf 'q'; sleep 0.5; printf 'q'; sleep 1; }
-tui_run() { # tui_run <fonction de saisie> : pilote « diskmedic --tui » dans un pseudo-terminal
+tui_run() { # tui_run <input function>: drives "diskmedic --tui" in a pseudo-terminal
     : >"$T/ts"; rm -f "$T/abort"
     "$1" | (cd "$T/par" && timeout -k 5 300 script -qfec "stty rows 30 cols 90; $BIN --tui" /dev/null) >"$T/ts" 2>&1 || true
     cp "$T/ts" "$T/err"
-    if [ -e "$T/abort" ]; then fail "sélection interrompue par sécurité : $(cat "$T/abort")"; fi
+    if [ -e "$T/abort" ]; then fail "selection aborted for safety: $(cat "$T/abort")"; fi
 }
-select_disks() { # coche les seuls disques scsi_debug, valide, puis attend le choix de l'opération
-    wait_screen 'SÉLECTION MULTIPLE' 60
+select_disks() { # selects only the scsi_debug disks, confirms, then waits for the operation menu
+    wait_screen 'MULTIPLE SELECTION' 60
     total=$(ls /sys/block | grep -cE '^(sd|hd|vd)[a-z]+$|^nvme[0-9]+n[0-9]+$')
     k=0
     while [ "$k" -lt "$total" ]; do
         case $(grep -a '> \[.\] /dev/' "$T/ts" | tail -1) in *scsi_debug*) press ' ' ;; esac
         press '\033[B'; k=$((k + 1))
     done
-    case $(grep -a 'Sélectionnés : ' "$T/ts" | tail -1) in
-        *'Sélectionnés : 2 /'*) ;;
-        *) abort_tui "le menu n'indique pas exactement 2 disques sélectionnés"; return 1 ;;
+    case $(grep -a 'Selected: ' "$T/ts" | tail -1) in
+        *'Selected: 2 /'*) ;;
+        *) abort_tui "the menu does not show exactly 2 selected disks"; return 1 ;;
     esac
-    printf '\r'; wait_screen "CHOIX DE L" 60
+    printf '\r'; wait_screen "CHOOSE THE OPERATION" 60
 }
-keys_verify() { select_disks || return 0; printf '2'; wait_screen 'appuyez sur une touche' 400; printf 'x'; sleep 1; }
+keys_verify() { select_disks || return 0; printf '2'; wait_screen 'press any key' 400; printf 'x'; sleep 1; }
 keys_zero_trim() {
     select_disks || return 0
-    printf '5'; wait_screen 'TRIM sur ces SSD' 60
+    printf '5'; wait_screen 'TRIM on these SSDs' 60
     if grep -a '^  /dev/.* (' "$T/ts" | grep -av scsi_debug | grep -q .; then
-        printf '\r'; echo "un disque autre que scsi_debug est dans la sélection" >"$T/abort"; sleep 1; return 0
+        printf '\r'; echo "a disk other than scsi_debug is in the selection" >"$T/abort"; sleep 1; return 0
     fi
-    printf 't\r'; wait_screen 'Tapez exactement OUI' 60
-    # Liste des disques visés (« /dev/x — modèle → opération ») : tous doivent être des scsi_debug.
+    printf 't\r'; wait_screen 'Type exactly YES' 60
+    # List of target disks ("/dev/x — model → operation"): all must be scsi_debug disks.
     if ! grep -a ' → ' "$T/ts" | grep -q . || grep -a ' → ' "$T/ts" | grep -av scsi_debug | grep -q .; then
-        printf '\r'; echo "la liste des disques à effacer contient autre chose que scsi_debug" >"$T/abort"; sleep 1; return 0
+        printf '\r'; echo "the list of disks to erase contains something other than scsi_debug" >"$T/abort"; sleep 1; return 0
     fi
-    printf 'OUI\r'; wait_screen 'appuyez sur une touche' 400; printf 'x'; sleep 1
+    printf 'YES\r'; wait_screen 'press any key' 400; printf 'x'; sleep 1
 }
 if command -v script >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
-    FMT="parallèle"; echo "== $FMT (2 disques, vérification simultanée via le menu)"
+    FMT="parallel"; echo "== $FMT (2 disks, simultaneous verification from the menu)"
     modprobe scsi_debug num_tgts=2 dev_size_mb=64; LOADED=1
     command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
     sleep 1
@@ -235,18 +235,18 @@ if command -v script >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
     for n in $(ls /sys/block | grep -E '^(sd|hd|vd)[a-z]+$|^nvme[0-9]+n[0-9]+$'); do
         grep -q scsi_debug "/sys/block/$n/device/model" 2>/dev/null && ndev=$((ndev + 1))
     done
-    [ "$ndev" -eq 2 ] || fail "2 disques scsi_debug attendus, $ndev trouvé(s)"
+    [ "$ndev" -eq 2 ] || fail "2 scsi_debug disks expected, $ndev found"
     mkdir "$T/par"
     tui_run keys_verify
-    grep -q 'Vérification · 2 disque(s) en parallèle' "$T/ts" || fail "tableau de bord parallèle absent"
-    grep -q 'En cours : 2 ' "$T/ts" || fail "les 2 disques n'ont pas tourné simultanément"
-    [ "$(grep -c '^  \[OK\] ' "$T/ts")" -eq 2 ] || fail "2 disques OK attendus dans le résumé"
-    [ "$(ls "$T"/par/diskmedic-*/*.log | wc -l)" -eq 2 ] || fail "2 journaux attendus"
-    [ "$(ls "$T"/par/diskmedic-*/*.csv | wc -l)" -eq 2 ] || fail "2 journaux CSV attendus"
+    grep -q 'Verification · 2 disk(s) in parallel' "$T/ts" || fail "parallel dashboard missing"
+    grep -q 'Running: 2 ' "$T/ts" || fail "the 2 disks did not run at the same time"
+    [ "$(grep -c '^  \[OK\] ' "$T/ts")" -eq 2 ] || fail "2 OK disks expected in the summary"
+    [ "$(ls "$T"/par/diskmedic-*/*.log | wc -l)" -eq 2 ] || fail "2 logs expected"
+    [ "$(ls "$T"/par/diskmedic-*/*.csv | wc -l)" -eq 2 ] || fail "2 CSV logs expected"
     unload
 
-    # Écriture zéro demandée sur 2 SSD : le menu propose TRIM à la place (t), puis OUI.
-    FMT="parallèle SSD"; echo "== $FMT (écriture zéro demandée, TRIM choisi pour les SSD)"
+    # Zero-fill requested on 2 SSDs: the menu offers TRIM instead (t), then YES.
+    FMT="parallel SSD"; echo "== $FMT (zero-fill requested, TRIM chosen for the SSDs)"
     modprobe scsi_debug num_tgts=2 dev_size_mb=64 lbpu=1 lbprz=1; LOADED=1
     command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
     sleep 1
@@ -257,12 +257,12 @@ if command -v script >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
     for d in $DEVS; do dd if=/dev/urandom of="$d" bs=1M count=64 oflag=direct status=none; done
     rm -rf "$T/par"; mkdir "$T/par"
     tui_run keys_zero_trim
-    grep -q 'SSD dans la sélection' "$T/ts" || fail "SSD non signalés avant l'écriture zéro"
-    grep -q 'TRIM · 2 disque(s) en parallèle' "$T/ts" || fail "tableau de bord TRIM absent"
-    [ "$(grep -c '^  \[OK\] .*· TRIM' "$T/ts")" -eq 2 ] || fail "2 TRIM OK attendus dans le résumé"
-    for d in $DEVS; do [ "$(tr -d '\000' <"$d" | wc -c)" -eq 0 ] || fail "$d non vidé par le TRIM"; done
+    grep -q 'SSDs in the selection' "$T/ts" || fail "SSDs not reported before the zero-fill"
+    grep -q 'TRIM · 2 disk(s) in parallel' "$T/ts" || fail "TRIM dashboard missing"
+    [ "$(grep -c '^  \[OK\] .*· TRIM' "$T/ts")" -eq 2 ] || fail "2 TRIM OK expected in the summary"
+    for d in $DEVS; do [ "$(tr -d '\000' <"$d" | wc -c)" -eq 0 ] || fail "$d not emptied by the TRIM"; done
     unload
 else
-    echo "SKIP : test multi-disques parallèle (commande script ou timeout absente)"
+    echo "SKIP: parallel multi-disk test (script or timeout command missing)"
 fi
-printf 'OK (formats de secteur)\n'
+printf 'OK (sector formats)\n'
