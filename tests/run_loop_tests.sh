@@ -104,7 +104,8 @@ if command -v dmsetup >/dev/null 2>&1; then
         run "" 0 "$D" --scan-slow
         grep -q 'lents confirmés : 2' "$T/out" || fail "2 blocs lents confirmés attendus"
         grep -q 'zone LBA 21120–21247' "$T/out" || fail "zone lente du bloc 10 mal localisée"
-        [ "$(grep -c '    zone LBA' "$T/out")" -eq 17 ] || fail "17 zones attendues (1 + bloc 30 entier)"
+        nz=$(grep -c '    zone LBA' "$T/out" || true)
+        [ "$nz" -eq 17 ] || { grep '    zone LBA' "$T/out" >&2; fail "17 zones attendues (1 + bloc 30 entier), $nz trouvée(s)"; }
         before=$(md5sum <"$D")
         run "OUI" 0 "$D" --slow-repair --log "$T/d.csv"
         [ "$before" = "$(md5sum <"$D")" ] || fail "slow-repair a modifié les données"

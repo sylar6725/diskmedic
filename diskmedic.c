@@ -1969,6 +1969,12 @@ static int timed_pread(disk_io_t *io, void *buf, size_t n, uint64_t off, double 
 #define ZONE_SIZE (64U * 1024U)
 #define ZONES_PER_BLOCK (BUF_SIZE / ZONE_SIZE)
 #define EVICT_BYTES (64ULL * 1024U * 1024U)
+/*
+ * Écart minimal pour retenir une zone sur le seul critère relatif (temps ≥ facteur × référence) :
+ * sur un support très rapide (référence de quelques centièmes de ms), le bruit de mesure
+ * dépasse sinon le seuil. Un secteur faible coûte des dizaines de ms : il reste détecté.
+ */
+#define ZONE_MIN_EXCESS_MS 1.0
 
 /* Zone lente localisée à l'intérieur d'un bloc de 1 Mio. */
 typedef struct {
@@ -2185,7 +2191,7 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
         size_t first = nzones;
         for (size_t z = 0; z < nz; z++) {
             sum += zt[z];
-            if (zt[z] - base >= 0.5 * excess || zt[z] >= zone_factor * base) {
+            if (zt[z] - base >= 0.5 * excess || (zt[z] >= zone_factor * base && zt[z] - base >= ZONE_MIN_EXCESS_MS)) {
                 size_t zo = z * zsz;
                 zone_t zn = {.block = k, .off = off + zo, .len = n - zo < zsz ? n - zo : zsz, .t = zt[z], .base = base, .t_after = -1};
                 if (zone_push(&zones, &nzones, &zcap, &zn) < 0) { perror("allocation zones"); goto out; }
