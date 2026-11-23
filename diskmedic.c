@@ -1225,26 +1225,33 @@ static int scsi_ie_asc = 0, scsi_ie_ascq = 0;
  * of bytes received, or -1.
  */
 static int scsi_cmd(int fd, const unsigned char *cdb, unsigned cdb_len, unsigned char *buf, unsigned len) {
-    unsigned char sense[64] = {0};
-    sg_io_hdr_t io; memset(&io, 0, sizeof(io));
-    if (len) memset(buf, 0, len);
-    io.interface_id = 'S'; io.cmd_len = (unsigned char)cdb_len; io.mx_sb_len = sizeof(sense);
-    io.dxfer_direction = len ? SG_DXFER_FROM_DEV : SG_DXFER_NONE; io.dxfer_len = len; io.dxferp = buf;
-    io.cmdp = (unsigned char *)cdb; io.sbp = sense; io.timeout = 30000;
-    if (ioctl(fd, SG_IO, &io) < 0) return -1;
-    if (io.host_status || (io.driver_status & ~0x08U)) return -1;
-    if (io.status) {
-        int desc = (sense[0] & 0x7f) >= 0x72;
-        unsigned key = io.sb_len_wr < 3 ? 0 : desc ? sense[1] & 0x0f : sense[2] & 0x0f;
-        int asc = -1, ascq = -1;
-        if (desc && io.sb_len_wr >= 4) { asc = sense[2]; ascq = sense[3]; }
-        else if (!desc && io.sb_len_wr >= 14) { asc = sense[12]; ascq = sense[13]; }
-        scsi_last_key = (int)key; scsi_last_asc = asc; scsi_last_ascq = ascq;
-        if (asc == 0x5d) { scsi_ie_asc = asc; scsi_ie_ascq = ascq; }
-        if (key != 0x00 && key != 0x01) return -1;
+    /*
+     * A UNIT ATTENTION (key 6h: reset, power on, mode parameters changed…) only reports an
+     * event and is cleared once returned: the command is simply sent again, a few times.
+     */
+    for (int attempt = 0;; attempt++) {
+        unsigned char sense[64] = {0};
+        sg_io_hdr_t io; memset(&io, 0, sizeof(io));
+        if (len) memset(buf, 0, len);
+        io.interface_id = 'S'; io.cmd_len = (unsigned char)cdb_len; io.mx_sb_len = sizeof(sense);
+        io.dxfer_direction = len ? SG_DXFER_FROM_DEV : SG_DXFER_NONE; io.dxfer_len = len; io.dxferp = buf;
+        io.cmdp = (unsigned char *)cdb; io.sbp = sense; io.timeout = 30000;
+        if (ioctl(fd, SG_IO, &io) < 0) return -1;
+        if (io.host_status || (io.driver_status & ~0x08U)) return -1;
+        if (io.status) {
+            int desc = (sense[0] & 0x7f) >= 0x72;
+            unsigned key = io.sb_len_wr < 3 ? 0 : desc ? sense[1] & 0x0f : sense[2] & 0x0f;
+            int asc = -1, ascq = -1;
+            if (desc && io.sb_len_wr >= 4) { asc = sense[2]; ascq = sense[3]; }
+            else if (!desc && io.sb_len_wr >= 14) { asc = sense[12]; ascq = sense[13]; }
+            scsi_last_key = (int)key; scsi_last_asc = asc; scsi_last_ascq = ascq;
+            if (asc == 0x5d) { scsi_ie_asc = asc; scsi_ie_ascq = ascq; }
+            if (key == 0x06 && attempt < 3) continue;
+            if (key != 0x00 && key != 0x01) return -1;
+        }
+        int got = (int)len - io.resid;
+        return got < 0 ? 0 : got;
     }
-    int got = (int)len - io.resid;
-    return got < 0 ? 0 : got;
 }
 static uint64_t be_val(const unsigned char *p, unsigned len) {
     uint64_t v = 0;
