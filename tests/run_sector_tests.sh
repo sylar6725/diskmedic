@@ -28,7 +28,11 @@ unload() {
 cleanup() { unload || true; rm -rf "$T"; }
 trap cleanup EXIT HUP INT TERM
 
-fail() { echo "FAILED [$FMT]: $*" >&2; cat "$T/err" >&2 2>/dev/null || true; exit 1; }
+fail() {
+    echo "FAILED [$FMT]: $*" >&2; cat "$T/err" >&2 2>/dev/null || true
+    echo "--- standard output (last 40 lines):" >&2; tail -40 "$T/out" >&2 2>/dev/null || true
+    exit 1
+}
 run() { # run <stdin> <expected exit> <args…>
     input=$1; wanted=$2; shift 2
     set +e; printf '%s\n' "$input" | "$BIN" "$@" >"$T/out" 2>"$T/err"; got=$?; set -e
