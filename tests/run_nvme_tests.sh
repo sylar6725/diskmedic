@@ -1,6 +1,6 @@
 #!/bin/sh
 # Tests NVMe sur des périphériques virtuels uniquement (jamais sur un disque réel) :
-#  1. nvme-loop : cible NVMe du noyau (nvmet) sur un fichier. Elle ne propose ni Format NVM
+#  1. nvme-loop : cible NVMe du noyau (nvmet), stockée dans un fichier. Elle ne propose ni Format NVM
 #     ni Sanitize : Secure Erase doit être refusé proprement; TRIM et SMART fonctionnent.
 #  2. QEMU : machine virtuelle avec trois contrôleurs NVMe émulés (secteurs de 512 o, de 4 Kio,
 #     et un contrôleur à deux namespaces). Format NVM y est réellement exécuté.
@@ -49,12 +49,13 @@ if modprobe nvmet 2>/dev/null && modprobe nvme-loop 2>/dev/null && [ -d /sys/ker
     echo "== $PART (NVMe sans Format ni Sanitize)"
     C=/sys/kernel/config/nvmet
     truncate -s 64M "$T/loop.img"
-    LOOPDEV=$(losetup -f --show "$T/loop.img")
     NQN="diskmedic-test-$$"
     mkdir "$C/subsystems/$NQN"
     echo 1 >"$C/subsystems/$NQN/attr_allow_any_host"
     mkdir "$C/subsystems/$NQN/namespaces/1"
-    printf '%s' "$LOOPDEV" >"$C/subsystems/$NQN/namespaces/1/device_path"
+    # Stockage fichier de nvmet (sans loop device : sur certains noyaux, la cible nvmet
+    # renvoie « Internal Error » à chaque écriture quand elle passe par un loop device).
+    printf '%s' "$T/loop.img" >"$C/subsystems/$NQN/namespaces/1/device_path"
     echo 1 >"$C/subsystems/$NQN/namespaces/1/enable"
     mkdir "$C/ports/9"
     echo loop >"$C/ports/9/addr_trtype"
@@ -78,10 +79,9 @@ if modprobe nvmet 2>/dev/null && modprobe nvme-loop 2>/dev/null && [ -d /sys/ker
     echo "  - smart ($DEV)"
     run "" 0 "$DEV" --smart
     grep -q 'Type      : SSD NVMe' "$T/out" || fail "fiche NVMe absente"
-    lsblk -o NAME,SIZE,TYPE,TRAN,MODEL "$DEV" "$LOOPDEV" 2>/dev/null || true
     dd if=/dev/urandom of="$DEV" bs=1M count=64 oflag=direct status=none 2>"$T/err" || fail "écriture sur $DEV impossible"
     before=$(md5sum <"$DEV")
-    echo "  - zero refusé : SSD NVMe reconnu (le noyau le dit rotatif : $(cat "/sys/block/${DEV#/dev/}/queue/rotational"))"
+    echo "  - zero refusé : SSD NVMe reconnu par le firmware (drapeau rotational du noyau : $(cat "/sys/block/${DEV#/dev/}/queue/rotational"))"
     run "OUI" 1 "$DEV" --zero
     grep -q 'Écriture zéro déconseillée : ce disque est un SSD NVMe' "$T/err" || fail "refus SSD de --zero absent"
     echo "  - secure-erase refusé avant confirmation (ni Format ni Sanitize)"
