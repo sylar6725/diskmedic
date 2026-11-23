@@ -1212,8 +1212,17 @@ out:
 /* ---------- SAS / SCSI SMART (LOG SENSE pages) ---------- */
 
 /*
+ * Last SCSI sense seen (for diagnostics), and failure prediction reported in sense data:
+ * depending on its MRIE setting, a disk reports "failure prediction threshold exceeded"
+ * (ASC 5Dh) as a CHECK CONDITION with the RECOVERED ERROR or NO SENSE key on ordinary
+ * commands, instead of (or as well as) in log page 2Fh.
+ */
+static int scsi_last_key = -1, scsi_last_asc = -1, scsi_last_ascq = -1;
+static int scsi_ie_asc = 0, scsi_ie_ascq = 0;
+/*
  * Generic SCSI command through SG_IO, without messages. A CHECK CONDITION with the
- * RECOVERED ERROR key is accepted (valid data). Returns the number of bytes received, or -1.
+ * RECOVERED ERROR or NO SENSE key is accepted (the data is valid). Returns the number
+ * of bytes received, or -1.
  */
 static int scsi_cmd(int fd, const unsigned char *cdb, unsigned cdb_len, unsigned char *buf, unsigned len) {
     unsigned char sense[64] = {0};
@@ -1225,8 +1234,14 @@ static int scsi_cmd(int fd, const unsigned char *cdb, unsigned cdb_len, unsigned
     if (ioctl(fd, SG_IO, &io) < 0) return -1;
     if (io.host_status || (io.driver_status & ~0x08U)) return -1;
     if (io.status) {
-        unsigned key = io.sb_len_wr < 3 ? 0 : ((sense[0] & 0x7f) >= 0x72 ? sense[1] & 0x0f : sense[2] & 0x0f);
-        if (key != 0x01) return -1;
+        int desc = (sense[0] & 0x7f) >= 0x72;
+        unsigned key = io.sb_len_wr < 3 ? 0 : desc ? sense[1] & 0x0f : sense[2] & 0x0f;
+        int asc = -1, ascq = -1;
+        if (desc && io.sb_len_wr >= 4) { asc = sense[2]; ascq = sense[3]; }
+        else if (!desc && io.sb_len_wr >= 14) { asc = sense[12]; ascq = sense[13]; }
+        scsi_last_key = (int)key; scsi_last_asc = asc; scsi_last_ascq = ascq;
+        if (asc == 0x5d) { scsi_ie_asc = asc; scsi_ie_ascq = ascq; }
+        if (key != 0x00 && key != 0x01) return -1;
     }
     int got = (int)len - io.resid;
     return got < 0 ? 0 : got;
@@ -1255,11 +1270,13 @@ typedef struct {
     char manufactured[24];
     int64_t power_on_minutes;           /* page 15h */
     int endurance_used;                 /* page 11h (SSD), %; -1 unknown */
+    int sense_key, sense_asc, sense_ascq;   /* last CHECK CONDITION seen; -1 none */
 } sas_info_t;
 
 static void sas_init(sas_info_t *si) {
     memset(si, 0, sizeof(*si));
     si->rotation = si->temp = si->temp_ref = si->endurance_used = -1;
+    si->sense_key = si->sense_asc = si->sense_ascq = -1;
     si->grown_defects = si->non_medium = si->power_on_minutes = -1;
     si->ss_spec = si->ss_acc = si->lu_spec = si->lu_acc = -1;
     for (int k = 0; k < 3; k++) si->corrected[k] = si->uncorrected[k] = si->processed[k] = -1;
@@ -1325,6 +1342,8 @@ static void sas_parse_defects(sas_info_t *si, const unsigned char *h, unsigned l
 static int sas_collect(int fd, sas_info_t *si) {
     unsigned char inq[96], pg[4096];
     sas_init(si);
+    scsi_last_key = scsi_last_asc = scsi_last_ascq = -1;
+    scsi_ie_asc = scsi_ie_ascq = 0;
     unsigned char icdb[6] = {0x12, 0, 0, 0, sizeof(inq), 0};
     if (scsi_cmd(fd, icdb, sizeof(icdb), inq, sizeof(inq)) < 36 || (inq[0] & 0x1f) != 0) return -1;
     memcpy(si->vendor, inq + 8, 8); trim(si->vendor);
@@ -1353,6 +1372,11 @@ static int sas_collect(int fd, sas_info_t *si) {
     /* READ DEFECT DATA(10): grown list (G list), "bytes from index" format. */
     unsigned char dcdb[10] = {0x37, 0, 0x08 | 0x04, 0, 0, 0, 0, 0, 8, 0}, d[8];
     if (scsi_cmd(fd, dcdb, sizeof(dcdb), d, sizeof(d)) >= 4) sas_parse_defects(si, d, 4);
+    /* Failure prediction reported in sense data (ASC 5Dh) counts like page 2Fh. */
+    if (scsi_ie_asc && !(si->ie_known && si->ie_asc)) {
+        si->ie_known = 1; si->ie_asc = scsi_ie_asc; si->ie_ascq = scsi_ie_ascq;
+    }
+    si->sense_key = scsi_last_key; si->sense_asc = scsi_last_asc; si->sense_ascq = scsi_last_ascq;
     return 0;
 }
 
@@ -1382,6 +1406,9 @@ static int sas_print(const sas_info_t *si, uint64_t bytes) {
            !si->ie_known ? "unknown" : failing ? "FAILURE PREDICTED" : "OK", c_reset());
     if (!known) {
         printf("\nNo readable health data (USB bridge or controller that does not pass SCSI pages through).\n");
+        if (si->sense_key >= 0)
+            printf("%sLast SCSI sense: key %Xh, ASC %02Xh, ASCQ %02Xh.%s\n", c_dim(), (unsigned)si->sense_key,
+                   (unsigned)(si->sense_asc & 0xff), (unsigned)(si->sense_ascq & 0xff), c_reset());
         printf("\n%sVERDICT: UNKNOWN%s\n", c_bold(), c_reset());
         return SEV_UNKNOWN;
     }
