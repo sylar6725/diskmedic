@@ -176,38 +176,64 @@ grep -q 'secteurs illisibles : 8' "$T/out" || fail "8 secteurs illisibles attend
 unload
 
 # Sélection multi-disques : deux disques vérifiés en parallèle (pseudo-terminal fourni par script).
-# Seuls les disques scsi_debug sont sélectionnés, et l'opération (vérification) est en lecture seule.
+# SÉCURITÉ : seuls les disques scsi_debug doivent être sélectionnés. Le test ne se fie pas à la
+# position des disques dans la liste (l'ordre du menu n'est pas l'ordre alphabétique : sdX avant
+# nvmeXnY) : il lit la ligne sous le curseur et ne coche que celles qui affichent « scsi_debug ».
+# Avant Entrée, l'écran doit indiquer exactement 2 disques sélectionnés; avant OUI, chaque disque
+# visé doit être un scsi_debug. Sinon le menu est quitté sans rien lancer, et le test échoue.
 # Chaque touche n'est envoyée qu'une fois l'écran attendu affiché (le démarrage peut être lent),
 # et le pseudo-terminal est borné dans le temps : un blocage fait échouer le test sans le figer.
 wait_screen() { # wait_screen <texte> <nombre de demi-secondes au plus>
-    j=0; while ! grep -q "$1" "$T/ts" 2>/dev/null && [ "$j" -lt "$2" ]; do sleep 0.5; j=$((j + 1)); done
+    j=0; while ! grep -aq "$1" "$T/ts" 2>/dev/null && [ "$j" -lt "$2" ]; do sleep 0.5; j=$((j + 1)); done
 }
+cursor_frames() { grep -ac '> \[.\] /dev/' "$T/ts" 2>/dev/null || true; }
+press() { # press <touche> : envoie une touche et attend que le menu soit redessiné
+    n=$(cursor_frames); printf "$1"; j=0
+    while [ "$(cursor_frames)" -le "$n" ] && [ "$j" -lt 40 ]; do sleep 0.25; j=$((j + 1)); done
+}
+abort_tui() { echo "$1" >"$T/abort"; printf 'q'; sleep 0.5; printf 'q'; sleep 1; }
 tui_run() { # tui_run <fonction de saisie> : pilote « diskmedic --tui » dans un pseudo-terminal
-    : >"$T/ts"
+    : >"$T/ts"; rm -f "$T/abort"
     "$1" | (cd "$T/par" && timeout -k 5 300 script -qfec "stty rows 30 cols 90; $BIN --tui" /dev/null) >"$T/ts" 2>&1 || true
     cp "$T/ts" "$T/err"
+    if [ -e "$T/abort" ]; then fail "sélection interrompue par sécurité : $(cat "$T/abort")"; fi
 }
-select_disks() { # sélectionne les disques scsi_debug, valide, puis attend le choix de l'opération
-    wait_screen 'SÉLECTION MULTIPLE' 60; printf "$KEYS"; sleep 0.3; printf '\r'; wait_screen "CHOIX DE L" 60
+select_disks() { # coche les seuls disques scsi_debug, valide, puis attend le choix de l'opération
+    wait_screen 'SÉLECTION MULTIPLE' 60
+    total=$(ls /sys/block | grep -cE '^(sd|hd|vd)[a-z]+$|^nvme[0-9]+n[0-9]+$')
+    k=0
+    while [ "$k" -lt "$total" ]; do
+        case $(grep -a '> \[.\] /dev/' "$T/ts" | tail -1) in *scsi_debug*) press ' ' ;; esac
+        press '\033[B'; k=$((k + 1))
+    done
+    case $(grep -a 'Sélectionnés : ' "$T/ts" | tail -1) in
+        *'Sélectionnés : 2 /'*) ;;
+        *) abort_tui "le menu n'indique pas exactement 2 disques sélectionnés"; return 1 ;;
+    esac
+    printf '\r'; wait_screen "CHOIX DE L" 60
 }
-keys_verify() { select_disks; printf '2'; wait_screen 'appuyez sur une touche' 400; printf 'x'; sleep 1; }
+keys_verify() { select_disks || return 0; printf '2'; wait_screen 'appuyez sur une touche' 400; printf 'x'; sleep 1; }
 keys_zero_trim() {
-    select_disks; printf '5'; wait_screen 'TRIM sur ces SSD' 60; printf 't\r'
-    wait_screen 'Tapez exactement OUI' 60; printf 'OUI\r'
-    wait_screen 'appuyez sur une touche' 400; printf 'x'; sleep 1
+    select_disks || return 0
+    printf '5'; wait_screen 'TRIM sur ces SSD' 60
+    if grep -a '^  /dev/.* (' "$T/ts" | grep -av scsi_debug | grep -q .; then
+        printf '\r'; echo "un disque autre que scsi_debug est dans la sélection" >"$T/abort"; sleep 1; return 0
+    fi
+    printf 't\r'; wait_screen 'Tapez exactement OUI' 60
+    # Liste des disques visés (« /dev/x — modèle → opération ») : tous doivent être des scsi_debug.
+    if ! grep -a ' → ' "$T/ts" | grep -q . || grep -a ' → ' "$T/ts" | grep -av scsi_debug | grep -q .; then
+        printf '\r'; echo "la liste des disques à effacer contient autre chose que scsi_debug" >"$T/abort"; sleep 1; return 0
+    fi
+    printf 'OUI\r'; wait_screen 'appuyez sur une touche' 400; printf 'x'; sleep 1
 }
 if command -v script >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
     FMT="parallèle"; echo "== $FMT (2 disques, vérification simultanée via le menu)"
     modprobe scsi_debug num_tgts=2 dev_size_mb=64; LOADED=1
     command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
     sleep 1
-    KEYS=""; i=0; prev=0; ndev=0
-    for n in $(ls /sys/block | grep -E '^(sd|hd|vd)[a-z]+$|^nvme[0-9]+n[0-9]+$' | sort); do
-        if grep -q scsi_debug "/sys/block/$n/device/model" 2>/dev/null; then
-            while [ "$prev" -lt "$i" ]; do KEYS="$KEYS\033[B"; prev=$((prev + 1)); done
-            KEYS="$KEYS "; ndev=$((ndev + 1))
-        fi
-        i=$((i + 1))
+    ndev=0
+    for n in $(ls /sys/block | grep -E '^(sd|hd|vd)[a-z]+$|^nvme[0-9]+n[0-9]+$'); do
+        grep -q scsi_debug "/sys/block/$n/device/model" 2>/dev/null && ndev=$((ndev + 1))
     done
     [ "$ndev" -eq 2 ] || fail "2 disques scsi_debug attendus, $ndev trouvé(s)"
     mkdir "$T/par"
