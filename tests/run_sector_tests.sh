@@ -177,7 +177,26 @@ unload
 
 # Sélection multi-disques : deux disques vérifiés en parallèle (pseudo-terminal fourni par script).
 # Seuls les disques scsi_debug sont sélectionnés, et l'opération (vérification) est en lecture seule.
-if command -v script >/dev/null 2>&1; then
+# Chaque touche n'est envoyée qu'une fois l'écran attendu affiché (le démarrage peut être lent),
+# et le pseudo-terminal est borné dans le temps : un blocage fait échouer le test sans le figer.
+wait_screen() { # wait_screen <texte> <nombre de demi-secondes au plus>
+    j=0; while ! grep -q "$1" "$T/ts" 2>/dev/null && [ "$j" -lt "$2" ]; do sleep 0.5; j=$((j + 1)); done
+}
+tui_run() { # tui_run <fonction de saisie> : pilote « diskmedic --tui » dans un pseudo-terminal
+    : >"$T/ts"
+    "$1" | (cd "$T/par" && timeout -k 5 300 script -qfec "stty rows 30 cols 90; $BIN --tui" /dev/null) >"$T/ts" 2>&1 || true
+    cp "$T/ts" "$T/err"
+}
+select_disks() { # sélectionne les disques scsi_debug, valide, puis attend le choix de l'opération
+    wait_screen 'SÉLECTION MULTIPLE' 60; printf "$KEYS"; sleep 0.3; printf '\r'; wait_screen "CHOIX DE L" 60
+}
+keys_verify() { select_disks; printf '2'; wait_screen 'appuyez sur une touche' 400; printf 'x'; sleep 1; }
+keys_zero_trim() {
+    select_disks; printf '5'; wait_screen 'TRIM sur ces SSD' 60; printf 't\r'
+    wait_screen 'Tapez exactement OUI' 60; printf 'OUI\r'
+    wait_screen 'appuyez sur une touche' 400; printf 'x'; sleep 1
+}
+if command -v script >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
     FMT="parallèle"; echo "== $FMT (2 disques, vérification simultanée via le menu)"
     modprobe scsi_debug num_tgts=2 dev_size_mb=64; LOADED=1
     command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
@@ -192,11 +211,7 @@ if command -v script >/dev/null 2>&1; then
     done
     [ "$ndev" -eq 2 ] || fail "2 disques scsi_debug attendus, $ndev trouvé(s)"
     mkdir "$T/par"
-    { sleep 1; printf "$KEYS"; sleep 0.5; printf '\r'; sleep 0.5; printf '2'
-      j=0
-      while ! grep -q 'appuyez sur une touche' "$T/ts" 2>/dev/null && [ "$j" -lt 240 ]; do sleep 0.5; j=$((j + 1)); done
-      printf 'x'; sleep 1; } | (cd "$T/par" && script -qfec "stty rows 30 cols 90; $BIN --tui" /dev/null) >"$T/ts" 2>&1 || true
-    cp "$T/ts" "$T/err"
+    tui_run keys_verify
     grep -q 'Vérification · 2 disque(s) en parallèle' "$T/ts" || fail "tableau de bord parallèle absent"
     grep -q 'En cours : 2 ' "$T/ts" || fail "les 2 disques n'ont pas tourné simultanément"
     [ "$(grep -c '^  \[OK\] ' "$T/ts")" -eq 2 ] || fail "2 disques OK attendus dans le résumé"
@@ -214,21 +229,14 @@ if command -v script >/dev/null 2>&1; then
         grep -q scsi_debug "/sys/block/$n/device/model" 2>/dev/null && DEVS="$DEVS /dev/$n"
     done
     for d in $DEVS; do dd if=/dev/urandom of="$d" bs=1M count=64 oflag=direct status=none; done
-    rm -rf "$T/par"; mkdir "$T/par"; : >"$T/ts"
-    { sleep 1; printf "$KEYS"; sleep 0.5; printf '\r'; sleep 0.5; printf '5'
-      j=0
-      while ! grep -q 'TRIM sur ces SSD' "$T/ts" 2>/dev/null && [ "$j" -lt 20 ]; do sleep 0.5; j=$((j + 1)); done
-      printf 't\r'; sleep 0.5; printf 'OUI\r'
-      j=0
-      while ! grep -q 'appuyez sur une touche' "$T/ts" 2>/dev/null && [ "$j" -lt 240 ]; do sleep 0.5; j=$((j + 1)); done
-      printf 'x'; sleep 1; } | (cd "$T/par" && script -qfec "stty rows 30 cols 90; $BIN --tui" /dev/null) >"$T/ts" 2>&1 || true
-    cp "$T/ts" "$T/err"
+    rm -rf "$T/par"; mkdir "$T/par"
+    tui_run keys_zero_trim
     grep -q 'SSD dans la sélection' "$T/ts" || fail "SSD non signalés avant l'écriture zéro"
     grep -q 'TRIM · 2 disque(s) en parallèle' "$T/ts" || fail "tableau de bord TRIM absent"
     [ "$(grep -c '^  \[OK\] .*· TRIM' "$T/ts")" -eq 2 ] || fail "2 TRIM OK attendus dans le résumé"
     for d in $DEVS; do [ "$(tr -d '\000' <"$d" | wc -c)" -eq 0 ] || fail "$d non vidé par le TRIM"; done
     unload
 else
-    echo "SKIP : test multi-disques parallèle (commande script absente)"
+    echo "SKIP : test multi-disques parallèle (commande script ou timeout absente)"
 fi
 printf 'OK (formats de secteur)\n'
