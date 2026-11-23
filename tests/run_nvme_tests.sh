@@ -1,14 +1,14 @@
 #!/bin/sh
-# Tests NVMe sur des périphériques virtuels uniquement (jamais sur un disque réel) :
-#  1. nvme-loop : cible NVMe du noyau (nvmet), stockée dans un fichier. Elle ne propose ni Format NVM
-#     ni Sanitize : Secure Erase doit être refusé proprement; TRIM et SMART fonctionnent.
-#  2. QEMU : machine virtuelle avec trois contrôleurs NVMe émulés (secteurs de 512 o, de 4 Kio,
-#     et un contrôleur à deux namespaces). Format NVM y est réellement exécuté.
-# Nécessite root. Partie 2 : qemu-system-x86_64, busybox statique, cpio, gzip, libc statique et
-# un noyau avec le pilote NVMe intégré (DISKMEDIC_TEST_KERNEL, noyau WSL ou /boot/vmlinuz-*).
-# Chaque partie dont les prérequis manquent est ignorée (SKIP).
+# NVMe tests on virtual devices only (never on a real disk):
+#  1. nvme-loop: the kernel's NVMe target (nvmet), stored in a file. It offers neither Format NVM
+#     nor Sanitize: Secure Erase must be refused cleanly; TRIM and SMART work.
+#  2. QEMU: virtual machine with three emulated NVMe controllers (512 B sectors, 4 KiB sectors,
+#     and a controller with two namespaces). Format NVM is actually run there.
+# Needs root. Part 2: qemu-system-x86_64, static busybox, cpio, gzip, static libc and
+# a kernel with the NVMe driver built in (DISKMEDIC_TEST_KERNEL, WSL kernel or /boot/vmlinuz-*).
+# Each part whose requirements are missing is skipped (SKIP).
 set -eu
-if [ "$(id -u)" -ne 0 ]; then echo "SKIP : tests NVMe (root requis)"; exit 0; fi
+if [ "$(id -u)" -ne 0 ]; then echo "SKIP: NVMe tests (root required)"; exit 0; fi
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 T=$(mktemp -d)
 BIN="$T/diskmedic"
@@ -32,29 +32,29 @@ cleanup() { teardown_loop; rm -rf "$T"; }
 trap cleanup EXIT HUP INT TERM
 
 fail() {
-    echo "ÉCHEC [$PART] : $*" >&2; cat "$T/err" >&2 2>/dev/null || true
-    echo "--- derniers messages du noyau :" >&2; dmesg 2>/dev/null | tail -25 >&2 || true
+    echo "FAILED [$PART]: $*" >&2; cat "$T/err" >&2 2>/dev/null || true
+    echo "--- last kernel messages:" >&2; dmesg 2>/dev/null | tail -25 >&2 || true
     exit 1
 }
-run() { # run <stdin> <exit attendu> <args…>
+run() { # run <stdin> <expected exit> <args…>
     input=$1; wanted=$2; shift 2
     set +e; printf '%s\n' "$input" | "$BIN" "$@" >"$T/out" 2>"$T/err"; got=$?; set -e
-    [ "$got" -eq "$wanted" ] || fail "exit $got au lieu de $wanted pour : $*"
+    [ "$got" -eq "$wanted" ] || fail "exit $got instead of $wanted for: $*"
 }
 nonzero() { tr -d '\000' <"$1" | wc -c | tr -d ' '; }
 
 # ---------- 1. nvme-loop ----------
 PART="nvme-loop"
 if modprobe nvmet 2>/dev/null && modprobe nvme-loop 2>/dev/null && [ -d /sys/kernel/config/nvmet ]; then
-    echo "== $PART (NVMe sans Format ni Sanitize)"
+    echo "== $PART (NVMe without Format or Sanitize)"
     C=/sys/kernel/config/nvmet
     truncate -s 64M "$T/loop.img"
     NQN="diskmedic-test-$$"
     mkdir "$C/subsystems/$NQN"
     echo 1 >"$C/subsystems/$NQN/attr_allow_any_host"
     mkdir "$C/subsystems/$NQN/namespaces/1"
-    # Stockage fichier de nvmet (sans loop device : sur certains noyaux, la cible nvmet
-    # renvoie « Internal Error » à chaque écriture quand elle passe par un loop device).
+    # nvmet file backend (no loop device: on some kernels, the nvmet target returns
+    # "Internal Error" on every write when it goes through a loop device).
     printf '%s' "$T/loop.img" >"$C/subsystems/$NQN/namespaces/1/device_path"
     echo 1 >"$C/subsystems/$NQN/namespaces/1/enable"
     mkdir "$C/ports/9"
@@ -75,27 +75,27 @@ if modprobe nvmet 2>/dev/null && modprobe nvme-loop 2>/dev/null && [ -d /sys/ker
         [ -n "$DEV" ] && [ -b "$DEV" ] && break
         sleep 0.5
     done
-    [ -n "$DEV" ] || fail "namespace nvme-loop introuvable"
+    [ -n "$DEV" ] || fail "nvme-loop namespace not found"
     echo "  - smart ($DEV)"
     run "" 0 "$DEV" --smart
-    grep -q 'Type      : SSD NVMe' "$T/out" || fail "fiche NVMe absente"
-    dd if=/dev/urandom of="$DEV" bs=1M count=64 oflag=direct status=none 2>"$T/err" || fail "écriture sur $DEV impossible"
+    grep -q 'Type      : NVMe SSD' "$T/out" || fail "NVMe identity missing"
+    dd if=/dev/urandom of="$DEV" bs=1M count=64 oflag=direct status=none 2>"$T/err" || fail "cannot write to $DEV"
     before=$(md5sum <"$DEV")
-    echo "  - zero refusé : SSD NVMe reconnu par le firmware (drapeau rotational du noyau : $(cat "/sys/block/${DEV#/dev/}/queue/rotational"))"
-    run "OUI" 1 "$DEV" --zero
-    grep -q 'Écriture zéro déconseillée : ce disque est un SSD NVMe' "$T/err" || fail "refus SSD de --zero absent"
-    echo "  - secure-erase refusé avant confirmation (ni Format ni Sanitize)"
-    run "OUI" 1 "$DEV" --secure-erase
-    grep -q 'ni Sanitize' "$T/err" || fail "refus Secure Erase absent"
-    grep -q 'Tapez exactement OUI' "$T/err" && fail "confirmation demandée alors que rien n'est possible"
-    [ "$before" = "$(md5sum <"$DEV")" ] || fail "un refus a modifié les données"
+    echo "  - zero refused: NVMe SSD recognized by the firmware (kernel rotational flag: $(cat "/sys/block/${DEV#/dev/}/queue/rotational"))"
+    run "YES" 1 "$DEV" --zero
+    grep -q 'Zero-fill not recommended on this disk (NVMe SSD)' "$T/err" || fail "SSD refusal of --zero missing"
+    echo "  - secure-erase refused before confirmation (neither Format nor Sanitize)"
+    run "YES" 1 "$DEV" --secure-erase
+    grep -q 'offers neither Sanitize' "$T/err" || fail "Secure Erase refusal missing"
+    grep -q 'Type exactly YES' "$T/err" && fail "confirmation asked although nothing is possible"
+    [ "$before" = "$(md5sum <"$DEV")" ] || fail "a refusal modified the data"
     echo "  - trim"
-    run "OUI" 0 "$DEV" --trim
-    grep -q 'tout est à zéro' "$T/err" || fail "relecture à zéro après TRIM non signalée"
-    [ "$(nonzero "$DEV")" -eq 0 ] || fail "octets non nuls après --trim"
+    run "YES" 0 "$DEV" --trim
+    grep -q 'everything is zero' "$T/err" || fail "zero read-back after TRIM not reported"
+    [ "$(nonzero "$DEV")" -eq 0 ] || fail "non-zero bytes after --trim"
     teardown_loop
 else
-    echo "SKIP : $PART (modules nvmet / nvme-loop absents)"
+    echo "SKIP: $PART (nvmet / nvme-loop modules missing)"
 fi
 
 # ---------- 2. QEMU ----------
@@ -111,14 +111,14 @@ missing=""
 command -v qemu-system-x86_64 >/dev/null 2>&1 || missing="$missing qemu-system-x86_64"
 command -v cpio >/dev/null 2>&1 || missing="$missing cpio"
 command -v gzip >/dev/null 2>&1 || missing="$missing gzip"
-if [ -z "$BB" ] || ldd "$BB" >/dev/null 2>&1; then missing="$missing busybox-statique"; fi
-[ -n "$KERNEL" ] || missing="$missing noyau"
-if [ -n "$missing" ]; then echo "SKIP : $PART (absent :$missing)"; echo "OK (NVMe)"; exit 0; fi
+if [ -z "$BB" ] || ldd "$BB" >/dev/null 2>&1; then missing="$missing static-busybox"; fi
+[ -n "$KERNEL" ] || missing="$missing kernel"
+if [ -n "$missing" ]; then echo "SKIP: $PART (missing:$missing)"; echo "OK (NVMe)"; exit 0; fi
 R="$T/vm/root"
 mkdir -p "$R/bin" "$R/proc" "$R/sys" "$R/dev" "$R/tmp"
 cp "$BB" "$R/bin/busybox"
 cc -O2 -Wall -Wextra -Werror -std=c99 -static "$ROOT/diskmedic.c" -o "$R/bin/diskmedic" 2>"$T/err" ||
-    { echo "SKIP : $PART (compilation statique impossible : libc statique absente ?)"; echo "OK (NVMe)"; exit 0; }
+    { echo "SKIP: $PART (static build failed: static libc missing?)"; echo "OK (NVMe)"; exit 0; }
 cat >"$R/init" <<'EOF'
 #!/bin/busybox sh
 /bin/busybox --install -s /bin
@@ -134,12 +134,12 @@ cat >"$R/test.sh" <<'EOF'
 FAILS=0
 ok() { echo "OK: $*"; }
 ko() { echo "FAIL: $*"; sed 's/^/    /' /tmp/err; FAILS=$((FAILS + 1)); }
-run() { # run <stdin> <exit attendu> <args…> ; 0 si le code de sortie est celui attendu
+run() { # run <stdin> <expected exit> <args…>; 0 if the exit code is the expected one
     input=$1; wanted=$2; shift 2
     printf '%s\n' "$input" | diskmedic "$@" >/tmp/out 2>/tmp/err; got=$?
-    [ "$got" -eq "$wanted" ] || { echo "FAIL: exit $got au lieu de $wanted pour : $*"; sed 's/^/    /' /tmp/err; FAILS=$((FAILS + 1)); return 1; }
+    [ "$got" -eq "$wanted" ] || { echo "FAIL: exit $got instead of $wanted for: $*"; sed 's/^/    /' /tmp/err; FAILS=$((FAILS + 1)); return 1; }
 }
-dev_of() { # dev_of <série> <nsid>
+dev_of() { # dev_of <serial> <nsid>
     for b in /sys/block/nvme*; do
         n=${b##*/}; case $n in *c*) continue ;; esac
         [ "$(tr -d ' ' <"$b/device/serial")" = "$1" ] && [ "$(cat "$b/nsid")" = "$2" ] && { echo "/dev/$n"; return 0; }
@@ -150,34 +150,34 @@ fill() { dd if=/dev/urandom of="$1" bs=1M count=64 conv=fsync 2>/dev/null; }
 fresh() { echo 3 >/proc/sys/vm/drop_caches; }
 nonzero() { fresh; tr -d '\000' <"$1" | wc -c; }
 sum() { fresh; md5sum <"$1"; }
-A=$(dev_of dm512 1) && B=$(dev_of dm4k 1) && C1=$(dev_of dm2ns 1) && C2=$(dev_of dm2ns 2) || { echo "FAIL: NVMe émulés introuvables"; ls /sys/block; exit 1; }
+A=$(dev_of dm512 1) && B=$(dev_of dm4k 1) && C1=$(dev_of dm2ns 1) && C2=$(dev_of dm2ns 2) || { echo "FAIL: emulated NVMe devices not found"; ls /sys/block; exit 1; }
 
-echo "-- $A : contrôleur QEMU, secteurs de 512 o"
-run "" 0 "$A" --smart && grep -q 'QEMU NVMe Ctrl' /tmp/out && ok "smart" || ko "smart : fiche QEMU absente"
+echo "-- $A: QEMU controller, 512 B sectors"
+run "" 0 "$A" --smart && grep -q 'QEMU NVMe Ctrl' /tmp/out && ok "smart" || ko "smart: QEMU identity missing"
 fill "$A"; before=$(sum "$A")
-run "OUI" 1 "$A" --zero && grep -q 'ce disque est un SSD NVMe' /tmp/err && ok "zero refusé (SSD)" || ko "zero non refusé"
-run "OUI" 1 "$A" --slow-repair && grep -q 'Réparation lente déconseillée' /tmp/err && ok "slow-repair refusé (SSD)" || ko "slow-repair non refusé"
-run "non" 2 "$A" --secure-erase && grep -q 'Secure Erase NVMe : Format NVM, effacement des données utilisateur' /tmp/err &&
-    ok "secure-erase : méthode annoncée avant confirmation" || ko "méthode non annoncée"
-[ "$before" = "$(sum "$A")" ] && ok "refus et annulation sans modification" || ko "données modifiées par un refus"
-run "OUI" 0 "$A" --zero --force && [ "$(nonzero "$A")" -eq 0 ] && ok "zero --force" || ko "zero --force"
+run "YES" 1 "$A" --zero && grep -q 'on this disk (NVMe SSD)' /tmp/err && ok "zero refused (SSD)" || ko "zero not refused"
+run "YES" 1 "$A" --slow-repair && grep -q 'Slow-block repair not recommended' /tmp/err && ok "slow-repair refused (SSD)" || ko "slow-repair not refused"
+run "no" 2 "$A" --secure-erase && grep -q 'NVMe Secure Erase: Format NVM, user data erase' /tmp/err &&
+    ok "secure-erase: method announced before confirmation" || ko "method not announced"
+[ "$before" = "$(sum "$A")" ] && ok "refusals and cancellation without any change" || ko "data modified by a refusal"
+run "YES" 0 "$A" --zero --force && [ "$(nonzero "$A")" -eq 0 ] && ok "zero --force" || ko "zero --force"
 fill "$A"
-run "OUI" 0 "$A" --trim && grep -q 'tout est à zéro' /tmp/err && [ "$(nonzero "$A")" -eq 0 ] && ok "trim" || ko "trim"
+run "YES" 0 "$A" --trim && grep -q 'everything is zero' /tmp/err && [ "$(nonzero "$A")" -eq 0 ] && ok "trim" || ko "trim"
 fill "$A"
-run "OUI" 0 "$A" --secure-erase && grep -q 'Méthode : Format NVM, effacement des données utilisateur' /tmp/err &&
-    grep -q 'tout est à zéro' /tmp/err && [ "$(nonzero "$A")" -eq 0 ] && ok "secure-erase (Format NVM, SES=1)" || ko "secure-erase"
+run "YES" 0 "$A" --secure-erase && grep -q 'Method: Format NVM, user data erase' /tmp/err &&
+    grep -q 'everything is zero' /tmp/err && [ "$(nonzero "$A")" -eq 0 ] && ok "secure-erase (Format NVM, SES=1)" || ko "secure-erase"
 
-echo "-- $B : secteurs de 4 Kio"
+echo "-- $B: 4 KiB sectors"
 ls0=$(cat /sys/block/${B#/dev/}/queue/logical_block_size); sz0=$(cat /sys/block/${B#/dev/}/size)
 fill "$B"
-run "OUI" 0 "$B" --secure-erase && [ "$(nonzero "$B")" -eq 0 ] && ok "secure-erase 4Kn" || ko "secure-erase 4Kn"
+run "YES" 0 "$B" --secure-erase && [ "$(nonzero "$B")" -eq 0 ] && ok "secure-erase 4Kn" || ko "secure-erase 4Kn"
 [ "$ls0" = 4096 ] && [ "$(cat /sys/block/${B#/dev/}/queue/logical_block_size)" = 4096 ] &&
-    [ "$(cat /sys/block/${B#/dev/}/size)" = "$sz0" ] && ok "format 4Kn et taille conservés" || ko "format de secteur modifié ($ls0)"
+    [ "$(cat /sys/block/${B#/dev/}/size)" = "$sz0" ] && ok "4Kn format and size kept" || ko "sector format changed ($ls0)"
 
-echo "-- $C1 / $C2 : un contrôleur, deux namespaces"
+echo "-- $C1 / $C2: one controller, two namespaces"
 fill "$C1"; fill "$C2"; other=$(sum "$C2")
-run "OUI" 0 "$C1" --secure-erase && [ "$(nonzero "$C1")" -eq 0 ] && ok "namespace 1 effacé" || ko "namespace 1 non effacé"
-[ "$other" = "$(sum "$C2")" ] && ok "namespace 2 intact" || ko "namespace 2 modifié"
+run "YES" 0 "$C1" --secure-erase && [ "$(nonzero "$C1")" -eq 0 ] && ok "namespace 1 erased" || ko "namespace 1 not erased"
+[ "$other" = "$(sum "$C2")" ] && ok "namespace 2 intact" || ko "namespace 2 modified"
 [ "$FAILS" -eq 0 ]
 EOF
 chmod +x "$R/init"
@@ -185,7 +185,7 @@ chmod +x "$R/init"
 for d in a b c1 c2; do truncate -s 64M "$T/vm/$d.img"; done
 ACCEL="-accel tcg"
 [ -w /dev/kvm ] && ACCEL="-enable-kvm -cpu host"
-echo "== $PART (3 contrôleurs NVMe émulés, noyau : $KERNEL, ${ACCEL%% *})"
+echo "== $PART (3 emulated NVMe controllers, kernel: $KERNEL, ${ACCEL%% *})"
 set +e
 # shellcheck disable=SC2086
 timeout 900 qemu-system-x86_64 $ACCEL -m 512 -smp 2 -nographic -no-reboot \
@@ -198,8 +198,8 @@ timeout 900 qemu-system-x86_64 $ACCEL -m 512 -smp 2 -nographic -no-reboot \
     </dev/null >"$T/vm.log" 2>&1
 set -e
 tr -d '\r' <"$T/vm.log" | sed -n '/^-- /p;/^OK: /p;/^FAIL: /,/^[^ ]/p' | sed 's/^OK: /  - /;s/^-- /  /'
-if grep -q '=== NO NVME' "$T/vm.log"; then echo "SKIP : $PART (le noyau invité n'a pas le pilote NVMe intégré)"
+if grep -q '=== NO NVME' "$T/vm.log"; then echo "SKIP: $PART (the guest kernel does not have the NVMe driver built in)"
 elif ! grep -q '=== RESULT PASS' "$T/vm.log"; then
-    : >"$T/err"; tail -40 "$T/vm.log" >&2; fail "tests dans la machine virtuelle en échec"
+    : >"$T/err"; tail -40 "$T/vm.log" >&2; fail "tests in the virtual machine failed"
 fi
 echo "OK (NVMe)"

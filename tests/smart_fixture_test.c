@@ -1,13 +1,13 @@
 /*
- * Test de l'affichage SMART sur des données fabriquées (aucun disque nécessaire).
- * Compile diskmedic.c dans la même unité de traduction pour accéder à ses fonctions
- * internes : smart_print_ata(), nvme_print() et parse_ata_sense().
+ * SMART display test on fabricated data (no disk needed).
+ * Compiles diskmedic.c in the same translation unit to reach its internal
+ * functions: smart_print_ata(), nvme_print() and parse_ata_sense().
  */
 #define main diskmedic_main
 #include "../diskmedic.c"
 #undef main
 
-/* Chaîne ATA IDENTIFY : complétée par des espaces, octets inversés deux à deux. */
+/* ATA IDENTIFY string: padded with spaces, bytes swapped in pairs. */
 static void put_ata_string(unsigned char *id, size_t off, size_t len, const char *s) {
     for (size_t i = 0; i < len; i++) {
         char c = i < strlen(s) ? s[i] : ' ';
@@ -23,7 +23,7 @@ static void put_attr(unsigned char *data, unsigned slot, uint8_t aid, uint8_t cu
 static void put_thr(unsigned char *thr, unsigned slot, uint8_t aid, uint8_t t) { thr[2 + slot * 12] = aid; thr[2 + slot * 12 + 1] = t; }
 static void put_le(unsigned char *p, unsigned n, uint64_t v) { for (unsigned i = 0; i < n; i++) p[i] = (unsigned char)(v >> (8 * i)); }
 
-/* Page LOG SENSE : en-tête de 4 octets, puis paramètres ajoutés par log_param(). */
+/* LOG SENSE page: 4-byte header, then parameters added by log_param(). */
 static unsigned log_page_begin(unsigned char *pg, uint8_t code) { memset(pg, 0, 512); pg[0] = code; return 4; }
 static unsigned log_param(unsigned char *pg, unsigned pos, uint16_t pc, unsigned len, uint64_t v) {
     pg[pos] = (unsigned char)(pc >> 8); pg[pos + 1] = (unsigned char)pc; pg[pos + 2] = 0x03; pg[pos + 3] = (unsigned char)len;
@@ -50,7 +50,7 @@ static void sas_fixture(sas_info_t *si, int failing) {
     pg[p] = 0; pg[p + 1] = 1; pg[p + 2] = 0x03; pg[p + 3] = 6; memcpy(pg + p + 4, "201612", 6); p += 10;
     p = log_param(pg, p, 3, 4, 50000); p = log_param(pg, p, 4, 4, 1204); log_page_end(pg, p, si);
     p = log_page_begin(pg, 0x15); p = log_param(pg, p, 0, 4, UINT64_C(23456) * 60); log_page_end(pg, p, si);
-    unsigned char defects[4] = {0, 0x0c, 0, (unsigned char)(failing ? 96 : 0)};   /* liste G, format 4, 8 o/défaut */
+    unsigned char defects[4] = {0, 0x0c, 0, (unsigned char)(failing ? 96 : 0)};   /* grown list, format 4, 8 B/defect */
     sas_parse_defects(si, defects, 4);
 }
 
@@ -58,14 +58,14 @@ int main(void) {
     unsigned char id[512], data[512], thr[512];
     uint64_t lba48 = UINT64_C(7814037168);
 
-    /* 1. Disque dur 4 To en mauvais état. */
+    /* 1. 4 TB hard disk in poor condition. */
     memset(id, 0, sizeof(id)); memset(data, 0, sizeof(data)); memset(thr, 0, sizeof(thr));
     put_ata_string(id, 20, 20, "WD-WCC7K1234567");
     put_ata_string(id, 46, 8, "82.00A82");
     put_ata_string(id, 54, 40, "WDC WD40EFRX-68N32N0");
     for (unsigned w = 0; w < 4; w++) put_word(id, 100 + w, (uint16_t)(lba48 >> (16 * w)));
     put_word(id, 82, 1); put_word(id, 85, 1); put_word(id, 217, 5400);
-    put_word(id, 76, 0x0e); put_word(id, 77, 2 << 1);        /* supporte 6 Gb/s, lien à 3 Gb/s */
+    put_word(id, 76, 0x0e); put_word(id, 77, 2 << 1);        /* supports 6 Gb/s, link at 3 Gb/s */
     put_word(id, 128, 0x21);
     put_attr(data, 0, 1, 200, 200, 0);         put_thr(thr, 0, 1, 51);
     put_attr(data, 1, 3, 180, 175, 6025);      put_thr(thr, 1, 3, 21);
@@ -79,7 +79,7 @@ int main(void) {
     printf("=== HDD\n"); fflush(stdout);
     smart_print_ata(id, data, thr, 1, 0);
 
-    /* 2. SSD SATA sain. */
+    /* 2. Healthy SATA SSD. */
     memset(id, 0, sizeof(id)); memset(data, 0, sizeof(data));
     put_ata_string(id, 20, 20, "S6PNNX0T123456");
     put_ata_string(id, 46, 8, "SVT02B6Q");
@@ -95,7 +95,7 @@ int main(void) {
     printf("=== SSD\n"); fflush(stdout);
     smart_print_ata(id, data, NULL, -1, UINT64_C(1000204886016));
 
-    /* 3. NVMe sain, 4. NVMe défaillant. */
+    /* 3. Healthy NVMe, 4. failing NVMe. */
     unsigned char ctrl[4096], log[512];
     memset(ctrl, 0, sizeof(ctrl)); memset(log, 0, sizeof(log));
     memcpy(ctrl + 4, "S4EWNX0R123456      ", 20);
@@ -111,7 +111,7 @@ int main(void) {
     printf("=== NVME_BAD\n"); fflush(stdout);
     nvme_print(ctrl, log, UINT64_C(1000204886016));
 
-    /* 5. SAS défaillant, SAS sain, SAS sans aucune donnée de santé. */
+    /* 5. Failing SAS, healthy SAS, SAS without any health data. */
     sas_info_t si;
     sas_fixture(&si, 1);
     printf("=== SAS_BAD\n"); fflush(stdout);
@@ -124,7 +124,7 @@ int main(void) {
     printf("=== SAS_NONE\n"); fflush(stdout);
     sas_print(&si, 0);
 
-    /* 6. Décodage des registres SAT (SMART RETURN STATUS). */
+    /* 6. Decoding of the SAT registers (SMART RETURN STATUS). */
     unsigned char desc[22] = {0x72, 0x01, 0x00, 0x1d, 0, 0, 0, 14,
                               0x09, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0x4f, 0, 0xc2, 0, 0x50};
     unsigned char fixed[18] = {0x70, 0, 0x01, 0, 0x50, 0, 0, 10, 0, 0, 0xf4, 0x2c, 0x00, 0x1d, 0, 0, 0, 0};
@@ -135,17 +135,17 @@ int main(void) {
     ok = parse_ata_sense(fixed, sizeof(fixed), &r);
     printf("fixed valid=%d mid=%02x high=%02x\n", ok, r.lba_mid, r.lba_high);
 
-    /* 7. Choix de la méthode Secure Erase NVMe (Identify Controller : OACS, SANICAP, FNA). */
+    /* 7. Choice of the NVMe Secure Erase method (Identify Controller: OACS, SANICAP, FNA). */
     static const struct { const char *name; uint16_t oacs; uint32_t sanicap; uint8_t fna; int ns; } ec[] = {
-        {"crypto+blocs", 0x0002, 0x3, 0x00, 1},
-        {"blocs", 0x0002, 0x2, 0x00, 1},
+        {"crypto+block", 0x0002, 0x3, 0x00, 1},
+        {"block", 0x0002, 0x2, 0x00, 1},
         {"format-crypto", 0x0002, 0x0, 0x04, 1},
         {"format", 0x0002, 0x0, 0x00, 1},
         {"multi-ns", 0x0002, 0x3, 0x00, 2},
         {"multi-ns-format-global", 0x0002, 0x3, 0x02, 2},
-        {"ns-inconnu", 0x0002, 0x1, 0x00, -1},
-        {"ecrasement-seul", 0x0000, 0x4, 0x00, 1},
-        {"rien", 0x0000, 0x0, 0x00, 1},
+        {"ns-unknown", 0x0002, 0x1, 0x00, -1},
+        {"overwrite-only", 0x0000, 0x4, 0x00, 1},
+        {"nothing", 0x0000, 0x0, 0x00, 1},
     };
     printf("=== ERASE\n");
     for (size_t i = 0; i < sizeof(ec) / sizeof(ec[0]); i++) {

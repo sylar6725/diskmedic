@@ -1,90 +1,91 @@
 # DiskMedic
 
-Utilitaire Linux en C pour **diagnostiquer et entretenir des disques** SATA, SAS/SCSI et NVMe. Il fait un rapport SMART lisible, vérifie le disque en lecture, détecte et répare les blocs lents, et efface les disques avec la méthode adaptée à leur type : zéros pour un disque dur, TRIM ou effacement firmware (ATA Secure Erase, NVMe Sanitize ou Format NVM) pour un SSD. On l'utilise en ligne de commande ou par un menu interactif qui traite **plusieurs disques en parallèle**.
+**English** · [Français](README.fr.md)
 
-- Un seul fichier source C99, sans bibliothèque externe.
-- Un binaire statique d'environ 1 Mo, qui fonctionne sur toute distribution Linux x86-64.
-- Interface en français.
-- Licence MIT : libre d'utiliser, de copier, de modifier et de partager.
+A Linux tool written in C to **diagnose and maintain SATA, SAS/SCSI and NVMe disks**. It produces a readable SMART report, verifies the disk by reading it, detects and repairs slow blocks, and erases disks with the method that suits their type: zeros for a hard disk, TRIM or a firmware erase (ATA Secure Erase, NVMe Sanitize or Format NVM) for an SSD. It runs from the command line or from an interactive menu that processes **several disks in parallel**.
+
+- A single C99 source file, with no external library.
+- A static binary of about 1 MB that runs on any x86-64 Linux distribution.
+- MIT license: free to use, copy, modify and share.
 
 > [!NOTE]
-> **Application « vibe codée »** : DiskMedic a été écrite en grande partie par une IA (Claude, via Claude Code), sous la direction d'un humain qui a guidé les choix, demandé les corrections et validé les résultats. Le code est couvert par des tests automatisés sur disques virtuels, mais il n'a pas fait l'objet d'une relecture humaine ligne par ligne et n'a été que peu testé sur du matériel réel. Gardez-le à l'esprit avant de l'utiliser sur des disques contenant des données importantes.
+> DiskMedic was largely vibe-coded with an AI assistant. It is covered by automated tests on virtual disks, but has had little testing on real hardware: use it with care on disks that hold important data.
 
 > [!WARNING]
-> `--zero`, `--slow-repair`, `--trim` et `--secure-erase` **détruisent des données**. Chacune demande de taper exactement `OUI`, et un disque monté ou utilisé est refusé. Vérifiez quand même le périphérique visé (`lsblk -o NAME,MODEL,SERIAL,SIZE`) : aucune récupération n'est possible.
+> `--zero`, `--slow-repair`, `--trim` and `--secure-erase` **destroy data**. Each one requires typing exactly `YES`, and a disk that is mounted or in use is refused. Still, double-check the target device (`lsblk -o NAME,MODEL,SERIAL,SIZE`): no recovery is possible.
 
 ---
 
-## Sommaire
+## Contents
 
-- [Fonctionnalités](#fonctionnalités)
+- [Features](#features)
 - [Installation](#installation)
-- [Utilisation](#utilisation)
-- [Interface interactive (TUI)](#interface-interactive-tui)
-- [Détails techniques](#détails-techniques)
-- [Tests et CI](#tests-et-ci)
-- [Limites connues](#limites-connues)
-- [Licence](#licence)
+- [Usage](#usage)
+- [Interactive interface (TUI)](#interactive-interface-tui)
+- [Technical details](#technical-details)
+- [Tests and CI](#tests-and-ci)
+- [Known limitations](#known-limitations)
+- [License](#license)
 
 ---
 
-## Fonctionnalités
+## Features
 
-| Fonction | SATA | SAS / SCSI | NVMe |
+| Feature | SATA | SAS / SCSI | NVMe |
 |---|:-:|:-:|:-:|
-| `--verify` : lecture intégrale | ✅ | ✅ | ✅ |
-| `--scan-slow` / `--slow-repair` : blocs lents | ✅ | ✅ | ✅ |
-| `--zero` : écriture de zéros + relecture | ✅ | ✅ | ✅ |
-| `--trim` : TRIM du disque entier + relecture | ✅ | ✅ (UNMAP) | ✅ (Deallocate) |
-| `--smart` : rapport de santé | ✅ attributs SMART ATA | ✅ pages LOG SENSE + liste des défauts | ✅ journal SMART/Health |
-| Fiche du disque dans le menu TUI | ✅ | ✅ | ✅ |
-| `--secure-erase` | ✅ ATA Security Erase | ❌ refusé | ✅ Sanitize ou Format NVM |
+| `--verify`: full read | ✅ | ✅ | ✅ |
+| `--scan-slow` / `--slow-repair`: slow blocks | ✅ | ✅ | ✅ |
+| `--zero`: write zeros + read back | ✅ | ✅ | ✅ |
+| `--trim`: TRIM of the whole disk + read back | ✅ | ✅ (UNMAP) | ✅ (Deallocate) |
+| `--smart`: health report | ✅ ATA SMART attributes | ✅ LOG SENSE pages + defect list | ✅ SMART/Health log |
+| Disk identity card in the TUI menu | ✅ | ✅ | ✅ |
+| `--secure-erase` | ✅ ATA Security Erase | ❌ refused | ✅ Sanitize or Format NVM |
 
-Les trois formats de secteur sont gérés : **512n** (512/512), **512e** (512 logique / 4096 physique) et **4Kn** (4096/4096).
+All three sector formats are supported: **512n** (512/512), **512e** (512 logical / 4096 physical) and **4Kn** (4096/4096).
 
-### SSD et NVMe
+### SSDs and NVMe
 
-Écrire des zéros sur un SSD ne le soigne pas et ne l'efface pas de façon sûre. La mémoire flash s'use à chaque écriture, les blocs de réserve gardent des copies des anciennes données, et le contrôleur, qui croit le disque plein, ralentit jusqu'au prochain TRIM. DiskMedic détecte donc le type de support avant toute écriture :
+Writing zeros over an SSD neither heals it nor erases it securely. The flash memory wears with every write, the spare blocks keep copies of the old data, and the controller, which believes the disk is full, slows down until the next TRIM. DiskMedic therefore detects the media type before any write:
 
-| Opération | Disque dur | SSD (SATA, SAS ou NVMe) |
+| Operation | Hard disk | SSD (SATA, SAS or NVMe) |
 |---|---|---|
-| `--zero` | Exécutée | **Refusée**, avec une explication. `--zero --force` l'exécute quand même |
-| `--slow-repair` | Exécutée | **Refusée** : un SSD rafraîchit lui-même ses données, et une lenteur y signale le contrôleur ou la flash. `--slow-repair --force` l'exécute quand même |
-| `--scan-slow` | Exécuté | Exécuté, avec une note sur l'interprétation |
-| `--trim` | Rarement géré (refus propre, rien n'est modifié) | Vide le disque en quelques secondes, sans usure |
-| `--secure-erase` | ATA Security Erase | ATA Security Erase (SATA), ou méthode NVMe choisie selon le disque |
+| `--zero` | Runs | **Refused**, with an explanation. `--zero --force` runs it anyway |
+| `--slow-repair` | Runs | **Refused**: an SSD refreshes its data by itself, and slowness there points to the controller or the flash. `--slow-repair --force` runs it anyway |
+| `--scan-slow` | Runs | Runs, with a note on how to read the results |
+| `--trim` | Rarely supported (clean refusal, nothing is modified) | Empties the disk in seconds, without wear |
+| `--secure-erase` | ATA Security Erase | ATA Security Erase (SATA), or an NVMe method chosen from the disk's capabilities |
 
-Le type de support est lu dans le firmware : tout NVMe est un SSD, puis vient le mot 217 d'IDENTIFY en ATA, puis la page VPD `B1h` en SCSI. Le drapeau `rotational` du noyau ne sert qu'en dernier recours, car il peut être faux : un NVMe monté sur un fichier loop, par exemple, y apparaît comme rotatif.
+The media type is read from the firmware: every NVMe device is an SSD, then comes IDENTIFY word 217 for ATA, then VPD page `B1h` for SCSI. The kernel's `rotational` flag is only a last resort, because it can be wrong: an NVMe device backed by a loop file, for example, shows up as rotational.
 
-Pour un NVMe, `--secure-erase` choisit la méthode d'après les capacités annoncées par le contrôleur (Identify Controller : `OACS`, `SANICAP`, `FNA`), dans cet ordre :
+For an NVMe device, `--secure-erase` chooses the method from the capabilities the controller reports (Identify Controller: `OACS`, `SANICAP`, `FNA`), in this order:
 
-1. **Sanitize cryptographique** : le disque change sa clé de chiffrement interne. C'est instantané et sans usure, et cela couvre aussi les blocs de réserve et les caches.
-2. **Sanitize par effacement des blocs**.
-3. **Format NVM cryptographique** (`SES=2`), si le disque l'annonce.
-4. **Format NVM avec effacement des données utilisateur** (`SES=1`), en conservant le format de secteur actuel.
+1. **Cryptographic Sanitize**: the disk changes its internal encryption key. It is instant and causes no wear, and it also covers the spare blocks and caches.
+2. **Block-erase Sanitize**.
+3. **Cryptographic Format NVM** (`SES=2`), if the disk reports it.
+4. **Format NVM with user data erase** (`SES=1`), keeping the current sector format.
 
-La méthode est annoncée avant la confirmation `OUI`. Sanitize agit sur tout le contrôleur : avec plusieurs namespaces actifs, DiskMedic ne l'utilise pas et passe à Format NVM, qui n'efface que le namespace visé, quand le disque le permet. Sinon, il refuse. L'écrasement par Sanitize n'est jamais utilisé, car il use la flash. Les capacités sont vérifiées par DiskMedic lui-même, sans compter sur un refus du disque : l'émulation NVMe de QEMU, par exemple, accepte un effacement cryptographique qu'elle n'annonce pas.
+The method is announced before the `YES` confirmation. Sanitize acts on the whole controller: with several active namespaces, DiskMedic does not use it and falls back to Format NVM, which only erases the target namespace, when the disk allows it. Otherwise it refuses. Sanitize overwrite is never used, because it wears the flash. DiskMedic checks the capabilities itself instead of relying on the disk to refuse: QEMU's NVMe emulation, for example, accepts a cryptographic erase that it does not report.
 
 ## Installation
 
-### Option 1 : binaire précompilé (aucune dépendance)
+### Option 1: prebuilt binary (no dependencies)
 
-Téléchargez l'archive et `SHA256SUMS` depuis la page [Releases](../../releases/latest). Le binaire est lié statiquement et ne dépend d'aucune bibliothèque de la machine.
+Download the archive and `SHA256SUMS` from the [Releases](../../releases/latest) page. The binary is statically linked and does not depend on any library on the machine.
 
 ```sh
-sha256sum -c SHA256SUMS --ignore-missing   # facultatif : contrôle d'intégrité
-tar -xzf diskmedic-1.10.0-linux-x86_64.tar.gz
-cd diskmedic-1.10.0-linux-x86_64
+sha256sum -c SHA256SUMS --ignore-missing   # optional: integrity check
+tar -xzf diskmedic-1.11.0-linux-x86_64.tar.gz
+cd diskmedic-1.11.0-linux-x86_64
 sudo ./diskmedic --help
 ```
 
-Seuls prérequis : Linux x86-64, noyau 3.2 ou plus récent, et les droits root.
+The only requirements are x86-64 Linux, kernel 3.2 or later, and root privileges.
 
-### Option 2 : compilation depuis les sources
+### Option 2: build from source
 
-**Dépendances de compilation** : un compilateur C99 (gcc), `make` et les en-têtes du noyau Linux. Le code utilise `<linux/fs.h>`, `<linux/nvme_ioctl.h>` et `<scsi/sg.h>`. Pour un binaire statique, il faut aussi la libc statique.
+**Build dependencies**: a C99 compiler (gcc), `make` and the Linux kernel headers. The code uses `<linux/fs.h>`, `<linux/nvme_ioctl.h>` and `<scsi/sg.h>`. A static binary also needs the static libc.
 
-| Distribution | Paquets |
+| Distribution | Packages |
 |---|---|
 | Debian / Ubuntu | `sudo apt install build-essential linux-libc-dev` |
 | Fedora / RHEL | `sudo dnf install gcc make kernel-headers glibc-static` |
@@ -92,226 +93,226 @@ Seuls prérequis : Linux x86-64, noyau 3.2 ou plus récent, et les droits root.
 | openSUSE | `sudo zypper install gcc make linux-glibc-devel glibc-devel-static` |
 
 ```sh
-make                 # compile ./diskmedic (-O2 -Wall -Wextra -Werror -std=c99)
-make test            # tests sans root
+make                 # builds ./diskmedic (-O2 -Wall -Wextra -Werror -std=c99)
+make test            # tests that do not need root
 
-# Binaire statique, portable d'une distribution à l'autre :
+# Static binary, portable across distributions:
 cc -O2 -Wall -Wextra -Werror -std=c99 -static diskmedic.c -o diskmedic && strip diskmedic
 ```
 
-Le code a été compilé et testé avec gcc 13 et la glibc sur Ubuntu 24.04. D'autres compilateurs ou libc (clang, musl) devraient fonctionner, mais n'ont pas été testés.
+The code has been built and tested with gcc 13 and glibc on Ubuntu 24.04. Other compilers or libcs (clang, musl) should work, but have not been tested.
 
-**Exécution** : rien n'est nécessaire en dehors du noyau. Il faut être root, ou disposer de `CAP_SYS_RAWIO` plus des droits sur le périphérique, pour envoyer des commandes ATA, SCSI ou NVMe brutes et ouvrir les disques en exclusivité.
+**Running**: nothing is needed besides the kernel. You must be root, or have `CAP_SYS_RAWIO` plus access to the device, to send raw ATA, SCSI or NVMe commands and open disks exclusively.
 
-## Utilisation
+## Usage
 
 ```sh
-sudo ./diskmedic /dev/sdX --smart                          # fiche + rapport SMART
-sudo ./diskmedic /dev/sdX --verify --log verif.csv         # lecture complète
-sudo ./diskmedic /dev/sdX --scan-slow --slow-factor 4      # recherche de blocs lents
-sudo ./diskmedic /dev/sdX --slow-repair --log repar.csv    # scan + réécriture ciblée  ⚠
-sudo ./diskmedic /dev/sdX --zero                           # zéros (disque dur)        ⚠
-sudo ./diskmedic /dev/nvme0n1 --trim                       # TRIM complet (SSD)        ⚠
-sudo ./diskmedic /dev/nvme0n1 --secure-erase               # effacement firmware       ⚠
-sudo ./diskmedic                                           # menu multi-disques
-sudo ./diskmedic --tui /dev/sdX                            # menu pour un seul disque
+sudo ./diskmedic /dev/sdX --smart                          # identity + SMART report
+sudo ./diskmedic /dev/sdX --verify --log verify.csv        # full read
+sudo ./diskmedic /dev/sdX --scan-slow --slow-factor 4      # look for slow blocks
+sudo ./diskmedic /dev/sdX --slow-repair --log repair.csv   # scan + targeted rewrite  ⚠
+sudo ./diskmedic /dev/sdX --zero                           # zeros (hard disk)        ⚠
+sudo ./diskmedic /dev/nvme0n1 --trim                       # full TRIM (SSD)          ⚠
+sudo ./diskmedic /dev/nvme0n1 --secure-erase               # firmware erase           ⚠
+sudo ./diskmedic                                           # multi-disk menu
+sudo ./diskmedic --tui /dev/sdX                            # menu for a single disk
 ```
 
-Une seule opération est acceptée par invocation.
+Only one operation is accepted per run.
 
-| Option | Rôle |
+| Option | Purpose |
 |---|---|
-| `--smart` (alias `--smart-only`) | Fiche du disque et rapport SMART lisible |
-| `--verify` | Lecture intégrale, sans écriture |
-| `--scan-slow` (alias `--slow-scan`) | Recherche des blocs anormalement lents (lecture seule) |
-| `--slow-factor N` | Seuil de lenteur = médiane × N (défaut : 4, minimum : 1) |
-| `--log FICHIER` | Journal CSV des secteurs défectueux ou lents (`--verify`, `--scan-slow`, `--slow-repair`) |
-| `--slow-repair` | Scan, puis réécriture des seules zones lentes confirmées (destructif) |
-| `--zero` | Écrit des zéros sur tout le disque, puis relit pour vérifier (destructif ; refusé sur SSD) |
-| `--trim` | TRIM du disque entier par tranches de 1 Gio, puis relecture d'échantillons (destructif) |
-| `--secure-erase` | ATA Security Erase (mode *enhanced* si proposé), ou NVMe Sanitize / Format NVM (destructif) |
-| `--force` | Avec `--zero` ou `--slow-repair` : lance l'opération même sur un SSD |
-| `--tui` | Menu interactif ; sans périphérique, sélection de plusieurs disques |
-| `--help`, `-h` / `--version` | Aide / version |
+| `--smart` (alias `--smart-only`) | Disk identity and readable SMART report |
+| `--verify` | Full read, without writing |
+| `--scan-slow` (alias `--slow-scan`) | Looks for abnormally slow blocks (read-only) |
+| `--slow-factor N` | Slowness threshold = median × N (default: 4, minimum: 1) |
+| `--log FILE` | CSV log of bad or slow sectors (`--verify`, `--scan-slow`, `--slow-repair`) |
+| `--slow-repair` | Scan, then rewrite the confirmed slow zones only (destructive) |
+| `--zero` | Writes zeros over the whole disk, then reads back to verify (destructive; refused on SSD) |
+| `--trim` | TRIM of the whole disk in 1 GiB chunks, then reads back samples (destructive) |
+| `--secure-erase` | ATA Security Erase (*enhanced* mode if offered), or NVMe Sanitize / Format NVM (destructive) |
+| `--force` | With `--zero` or `--slow-repair`: runs the operation even on an SSD |
+| `--tui` | Interactive menu; without a device, multi-disk selection |
+| `--help`, `-h` / `--version` | Help / version |
 
-**Codes de sortie**
+**Exit codes**
 
-| Code | Signification |
+| Code | Meaning |
 |---|---|
-| `0` | Succès |
-| `1` | Erreur, opération refusée (SSD, Secure Erase impossible, TRIM non géré), secteurs illisibles trouvés, ou au moins un disque en échec (mode multi-disques) |
-| `2` | Options invalides, confirmation `OUI` absente, ou mode TUI demandé sans terminal |
+| `0` | Success |
+| `1` | Error, refused operation (SSD, Secure Erase not possible, TRIM not supported), unreadable sectors found, or at least one failed disk (multi-disk mode) |
+| `2` | Invalid options, missing `YES` confirmation, or TUI mode without a terminal |
 
-**Journal CSV** : il contient les colonnes `horodatage_iso8601,périphérique,type_operation,LBA,état,action`. Les LBA sont exprimés en secteurs logiques.
+**CSV log**: it has the columns `timestamp_iso8601,device,operation,LBA,status,action`. LBAs are expressed in logical sectors.
 
-## Interface interactive (TUI)
+## Interactive interface (TUI)
 
-`sudo ./diskmedic` ouvre la sélection des disques :
+`sudo ./diskmedic` opens the disk selection:
 
-| Touche | Action |
+| Key | Action |
 |---|---|
-| ↑ / ↓ | Se déplacer |
-| Espace | Sélectionner ou désélectionner un disque |
-| `a` | Tout sélectionner ou tout désélectionner |
-| Entrée | Valider, puis choisir l'opération (1 à 7, 7 = TRIM) |
-| `q` | Quitter |
+| ↑ / ↓ | Move |
+| Space | Select or deselect a disk |
+| `a` | Select or deselect all |
+| Enter | Confirm, then choose the operation (1 to 7, 7 = TRIM) |
+| `q` | Quit |
 
-Les disques sélectionnés sont **traités en parallèle**, un processus par disque, et suivis sur un tableau de bord plein écran :
+The selected disks are **processed in parallel**, one process per disk, and followed on a full-screen dashboard:
 
 ```
 ╔════════════════════════════════════════════════════════════════════════════════════════╗
-║DiskMedic 1.10.0 · Scan lent · 3 disque(s) en parallèle                         00:00:03║
+║DiskMedic 1.11.0 · Slow scan · 3 disk(s) in parallel                            00:00:03║
 ╠════════════════════════════════════════════════════════════════════════════════════════╣
-║/dev/sde · scsi_debug · 201,3 Mo                                     EN COURS · 00:00:03║
-║  Étape : Passage 1/2 : mesure                                            illisibles : 1║
-║  ██████████████████████████████████████████████ 100,0 % · 158,4 Mio/s · reste 00:00:00 ║
-║  › Secteur illisible : LBA 20483 (No data available)                                   ║
+║/dev/sde · scsi_debug · 201.3 MB                                      RUNNING · 00:00:03║
+║  Step: Pass 1/2: timing                                                   unreadable: 1║
+║  ██████████████████████████████████████████████ 100.0 % · 158.4 MiB/s · left 00:00:00  ║
+║  › Unreadable sector: LBA 20483 (No data available)                                    ║
 ╠════════════════════════════════════════════════════════════════════════════════════════╣
-║  … un bloc par disque …                                                                ║
+║  … one block per disk …                                                                ║
 ╠════════════════════════════════════════════════════════════════════════════════════════╣
-║En cours : 3 · Terminés : 0 (OK : 0, échecs : 0)                                        ║
-║Journaux : /root/diskmedic-20261121-232657                                              ║
-║q = interrompre toutes les opérations                                                   ║
+║Running: 3 · Finished: 0 (OK: 0, failed: 0)                                             ║
+║Logs: /root/diskmedic-20261121-232657                                                   ║
+║q = interrupt all operations                                                            ║
 ╚════════════════════════════════════════════════════════════════════════════════════════╝
 ```
 
-Pour chaque disque, le tableau de bord montre :
+For each disk, the dashboard shows:
 
-- l'état et le temps écoulé ;
-- l'étape en cours et le nombre de secteurs illisibles trouvés ;
-- le débit et le temps restant ;
-- le dernier message de l'opération ;
-- une alerte « mis à jour il y a N s » quand le disque n'avance plus (nouvelles tentatives sur un secteur défectueux).
+- the state and elapsed time;
+- the current step and the number of unreadable sectors found;
+- the rate and time left;
+- the last message of the operation;
+- an "updated N s ago" alert when the disk stops making progress (retries on a bad sector).
 
-Si la fenêtre est petite, l'affichage passe à deux lignes par disque.
+In a small window, the display switches to two lines per disk.
 
-- **Interruption** : `q` ou Ctrl+C, puis `o` pour confirmer. Le résumé indique l'étape et le pourcentage atteints par chaque disque. Un Secure Erase ne peut pas être interrompu, car c'est le firmware du disque qui l'exécute.
-- **Journaux** : un dossier `diskmedic-AAAAMMJJ-HHMMSS/` est créé dans le dossier courant (ou dans `/tmp`). Il contient un `sdX.log` par disque, plus un `sdX.csv` pour la vérification et le scan. Sous `sudo`, les fichiers sont attribués à l'utilisateur appelant.
-- **Fin** : le terminal normal affiche le rapport de chaque disque, puis un résumé `[OK]` / `[ÉCHEC]` / `[INTERROMPU]`.
-- **Sécurité** : avant une opération destructive, la liste des disques visés s'affiche, avec l'opération prévue pour chacun. Si un seul d'entre eux est monté ou utilisé, rien n'est lancé.
-- **SSD dans la sélection** : pour une écriture zéro, DiskMedic liste les SSD et propose `t` (TRIM sur les SSD, zéros sur les disques durs), `z` (zéros partout) ou l'annulation. Pour une réparation lente, il propose `s` (scan seul sur les SSD), `r` (réparer partout) ou l'annulation.
+- **Interrupting**: `q` or Ctrl+C, then `y` to confirm. The summary shows the step and percentage each disk had reached. A Secure Erase cannot be interrupted, because the disk's firmware runs it.
+- **Logs**: a `diskmedic-YYYYMMDD-HHMMSS/` directory is created in the current directory (or in `/tmp`). It holds one `sdX.log` per disk, plus an `sdX.csv` for verification and scans. Under `sudo`, the files are given to the calling user.
+- **End**: the normal terminal shows each disk's report, then an `[OK]` / `[FAILED]` / `[INTERRUPTED]` summary.
+- **Safety**: before a destructive operation, the list of target disks is shown, with the planned operation for each one. If a single one of them is mounted or in use, nothing is started.
+- **SSDs in the selection**: for a zero-fill, DiskMedic lists the SSDs and offers `t` (TRIM on the SSDs, zeros on the hard disks), `z` (zeros everywhere) or cancellation. For a slow-block repair, it offers `s` (scan only on the SSDs), `r` (repair everywhere) or cancellation.
 
-Avec `--tui /dev/sdX`, le menu porte sur un seul disque. Son en-tête affiche la fiche du disque, quel que soit son type :
+With `--tui /dev/sdX`, the menu covers a single disk. Its header shows the disk's identity card, whatever its type:
 
-- SATA : modèle, série, firmware ;
-- NVMe : santé, température, vie restante ;
-- SAS : avis du firmware, température.
+- SATA: model, serial, firmware;
+- NVMe: health, temperature, remaining life;
+- SAS: firmware assessment, temperature.
 
-Il indique aussi la capacité, le format de secteur et le type de support (SSD ou disque dur). Sur un SSD, les choix 4 et 5 proposent l'alternative adaptée (scan seul, TRIM) ou l'opération quand même.
+It also shows the capacity, the sector format and the media type (SSD or hard disk). On an SSD, choices 4 and 5 offer the suitable alternative (scan only, TRIM) or the operation anyway.
 
-## Détails techniques
+## Technical details
 
-### Accès au matériel
+### Hardware access
 
-| Élément | Mise en œuvre |
+| Item | Implementation |
 |---|---|
-| Commandes ATA (SATA, y compris derrière une passerelle USB/SAT) | `SG_IO` + ATA PASS-THROUGH(16), opcode `85h`. Registres de retour lus dans le descripteur sense `09h` ou dans le sense fixe (ASC/ASCQ `00/1Dh`) |
-| SMART ATA | IDENTIFY DEVICE (`ECh`), SMART READ DATA (`D0h`), READ THRESHOLDS (`D1h`), RETURN STATUS (`DAh`) |
-| NVMe | `NVME_IOCTL_ADMIN_CMD` : Identify Controller / Namespace / liste des namespaces actifs (CNS `01h`, `00h`, `02h`), Get Log Page `02h` (SMART/Health) et `81h` (état du Sanitize), Sanitize (`84h`), Format NVM (`80h`) |
-| SAS / SCSI | INQUIRY + pages VPD `80h`/`B1h`, LOG SENSE (`2Fh`, `0Dh`, `03h`, `02h`, `05h`, `06h`, `0Eh`, `15h`, `11h`), READ DEFECT DATA(10) pour la liste des défauts apparus (liste G) |
-| Détection du type | NVMe (`NVME_IOCTL_ID`), puis IDENTIFY ATA, puis INQUIRY SCSI |
-| Détection SSD / disque dur | NVMe, mot 217 d'IDENTIFY (vitesse de rotation), VPD `B1h`, puis `/sys/dev/block/M:m/queue/rotational` |
-| TRIM | `BLKDISCARD` par tranches de 1 Gio (le noyau le traduit en DATA SET MANAGEMENT, UNMAP ou Deallocate) |
-| Géométrie | `BLKGETSIZE64`, `BLKSSZGET` (secteur logique), `BLKPBSZGET` (secteur physique) |
+| ATA commands (SATA, including behind a USB/SAT bridge) | `SG_IO` + ATA PASS-THROUGH(16), opcode `85h`. Return registers read from sense descriptor `09h` or from fixed sense (ASC/ASCQ `00/1Dh`) |
+| ATA SMART | IDENTIFY DEVICE (`ECh`), SMART READ DATA (`D0h`), READ THRESHOLDS (`D1h`), RETURN STATUS (`DAh`) |
+| NVMe | `NVME_IOCTL_ADMIN_CMD`: Identify Controller / Namespace / active namespace list (CNS `01h`, `00h`, `02h`), Get Log Page `02h` (SMART/Health) and `81h` (Sanitize status), Sanitize (`84h`), Format NVM (`80h`) |
+| SAS / SCSI | INQUIRY + VPD pages `80h`/`B1h`, LOG SENSE (`2Fh`, `0Dh`, `03h`, `02h`, `05h`, `06h`, `0Eh`, `15h`, `11h`), READ DEFECT DATA(10) for the grown defect list (G list) |
+| Type detection | NVMe (`NVME_IOCTL_ID`), then ATA IDENTIFY, then SCSI INQUIRY |
+| SSD / hard disk detection | NVMe, IDENTIFY word 217 (rotation rate), VPD `B1h`, then `/sys/dev/block/M:m/queue/rotational` |
+| TRIM | `BLKDISCARD` in 1 GiB chunks (the kernel turns it into DATA SET MANAGEMENT, UNMAP or Deallocate) |
+| Geometry | `BLKGETSIZE64`, `BLKSSZGET` (logical sector), `BLKPBSZGET` (physical sector) |
 
-### Fiabilité des mesures et sécurité
+### Measurement reliability and safety
 
-- **Revendication exclusive** : avant toute écriture, le disque est ouvert avec `O_EXCL`. Le noyau refuse cette ouverture si le disque, ou l'une de ses partitions, est monté, utilisé en swap, en RAID ou en LVM.
-- **`O_DIRECT`** : les lectures et les écritures contournent le cache de pages, avec des tampons alignés et `posix_fadvise(DONTNEED)`. Le programme revient aux E/S tamponnées si le périphérique ne gère pas `O_DIRECT`.
-- **Relecture par secteur physique** : un bloc illisible est relu d'abord secteur physique par secteur physique, puis secteur logique par secteur logique pour les seuls secteurs physiques en échec. Sur un disque 512e, un secteur physique entièrement perdu coûte ainsi 4 lectures en échec au lieu de 9, chaque échec pouvant prendre plusieurs secondes de nouvelles tentatives au disque.
-- **Secure Erase** : le mot de passe ATA temporaire est `diskmedic`, et il est affiché avant l'opération. Après une interruption, le disque se déverrouille avec :
-  `hdparm --user-master u --security-unlock diskmedic /dev/sdX`, puis `--security-disable diskmedic`.
-  Un disque verrouillé par une version antérieure au renommage du projet (zero-fix) a pour mot de passe `zero-fix`.
-- **Sanitize NVMe** : il est lancé avec `AUSE=1`, ce qui permet de sortir du mode d'échec si l'effacement échoue. Son avancement est lu dans le journal `81h`. Le disque le poursuit seul, même après une coupure de courant ou l'arrêt de DiskMedic.
+- **Exclusive claim**: before any write, the disk is opened with `O_EXCL`. The kernel refuses this if the disk, or one of its partitions, is mounted, used as swap, or part of a RAID or LVM setup.
+- **`O_DIRECT`**: reads and writes bypass the page cache, with aligned buffers and `posix_fadvise(DONTNEED)`. The program falls back to buffered I/O if the device does not support `O_DIRECT`.
+- **Physical-sector re-reads**: an unreadable block is first re-read physical sector by physical sector, then logical sector by logical sector for the failed physical sectors only. On a 512e disk, a fully lost physical sector thus costs 4 failed reads instead of 9, and each failure can take the disk several seconds of retries.
+- **Secure Erase**: the temporary ATA password is `diskmedic`, and it is shown before the operation. After an interruption, unlock the disk with:
+  `hdparm --user-master u --security-unlock diskmedic /dev/sdX`, then `--security-disable diskmedic`.
+  A disk locked by a version older than the project's rename (zero-fix) has the password `zero-fix`.
+- **NVMe Sanitize**: it is started with `AUSE=1`, which allows leaving the failure mode if the erase fails. Its progress is read from log `81h`. The disk carries on by itself, even after a power loss or if DiskMedic stops.
 
-### Algorithme du scan de blocs lents
+### Slow-block scan algorithm
 
-1. **Passage 1, mesure** : chaque bloc de 1 Mio est chronométré. La médiane est calculée sur un échantillon de 1 million de mesures au plus, et le seuil vaut médiane × `--slow-factor`, avec un écart minimal de 5 ms au-dessus de la médiane. Sans ce plancher, sur un support très rapide (NVMe, médiane inférieure à 1 ms), les pauses ordinaires du système suffiraient à dépasser le seuil. Une relecture sur disque dur coûte au moins un tour de plateau (8 à 11 ms) et reste détectée.
-2. **Passage 2, confirmation** : un bloc n'est retenu que s'il dépasse le seuil aux deux passages. Un bloc lent à un seul passage est classé *intermittent* et n'est jamais réécrit.
-3. **Localisation** : chaque bloc confirmé est relu par zones de 64 Kio, ou de la taille du secteur physique si elle est plus grande, de la dernière zone à la première. Une zone est lente si elle porte au moins la moitié du retard du bloc, ou si elle dépasse le facteur × la zone de référence avec au moins 1 ms d'écart. Avant cela, 64 Mio sont lus ailleurs sur le disque pour vider son cache. Chaque zone est comparée à une zone saine de référence.
-4. **Réécriture ciblée** (`--slow-repair`) : seules les zones lentes sont réécrites, avec leurs propres données, puis relues et comparées. Dans un bloc illisible, seuls les secteurs physiques qui contiennent un secteur perdu sont réécrits ; la partie perdue est remplacée par des zéros, ce qui permet au firmware de réallouer le secteur.
-5. **Contrôle différé** : chaque zone réécrite est rechronométrée après un nouveau vidage du cache, puis classée `RAPIDE` ou `TOUJOURS LENT`.
+1. **Pass 1, timing**: each 1 MiB block is timed. The median is computed over a sample of at most 1 million measurements, and the threshold is median × `--slow-factor`, with a minimum gap of 5 ms above the median. Without this floor, on very fast media (NVMe, median below 1 ms), ordinary system pauses would be enough to exceed the threshold. A re-read on a hard disk costs at least one platter revolution (8 to 11 ms), so it is still detected.
+2. **Pass 2, confirmation**: a block is kept only if it exceeds the threshold on both passes. A block that is slow on one pass only is classified as *intermittent* and is never rewritten.
+3. **Location**: each confirmed block is read again in 64 KiB zones (or zones of the physical sector size, if larger), from the last zone to the first. Beforehand, 64 MiB are read elsewhere on the disk to flush its cache. Each zone is compared to a healthy reference zone: a zone is slow if it carries at least half of the block's delay, or if it exceeds the factor × the reference with a gap of at least 1 ms.
+4. **Targeted rewrite** (`--slow-repair`): only the slow zones are rewritten, with their own data, then read back and compared. In an unreadable block, only the physical sectors that contain a lost sector are rewritten; the lost part is replaced with zeros, which lets the firmware reallocate the sector.
+5. **Deferred check**: each rewritten zone is timed again after another cache flush, then classified as `FAST` or `STILL SLOW`.
 
-### Exécution parallèle
+### Parallel execution
 
-- **Isolation** : chaque disque est traité par un processus fils (`fork`), qui a ses propres tailles de secteur, son propre journal CSV et son propre descripteur `O_DIRECT`. Aucun état n'est partagé entre disques.
-- **Avancement** : chaque processus publie son étape, ses octets traités, ses débits et ses secteurs illisibles dans une zone `mmap(MAP_SHARED)`. Cette zone est protégée par un verrou de séquence, que le tableau de bord lit sans bloquer, quatre fois par seconde.
-- **Sorties** : la sortie standard et la sortie d'erreur de chaque processus sont redirigées vers son journal `.log`.
-- **Clavier** : il est lu sans signaux, si bien que Ctrl+C devient une touche et que l'interruption est toujours confirmée. `SIGTERM` et `SIGHUP` arrêtent proprement les processus fils.
+- **Isolation**: each disk is handled by a child process (`fork`), with its own sector sizes, CSV log and `O_DIRECT` descriptor. No state is shared between disks.
+- **Progress**: each process publishes its step, bytes processed, rates and unreadable sectors in an `mmap(MAP_SHARED)` area. This area is protected by a sequence lock, which the dashboard reads without blocking, four times per second.
+- **Output**: each process's standard output and standard error are redirected to its `.log` file.
+- **Keyboard**: it is read without signals, so Ctrl+C becomes a key and an interruption is always confirmed. `SIGTERM` and `SIGHUP` stop the child processes cleanly.
 
-### Ressources utilisées
+### Resources used
 
-- **Mémoire** :
-  - vérification et écriture zéro : quelques Mio ;
-  - scan lent : environ 4 Mio de RAM par To de disque, plus 8 Mio pour l'échantillon de mesures.
-- **E/S** : des blocs de 1 Mio. En mode multi-disques, les disques d'un même contrôleur, d'un même hub USB ou d'un même boîtier se partagent sa bande passante.
+- **Memory**:
+  - verification and zero-fill: a few MiB;
+  - slow scan: about 4 MiB of RAM per TB of disk, plus 8 MiB for the measurement sample.
+- **I/O**: 1 MiB blocks. In multi-disk mode, disks on the same controller, USB hub or enclosure share its bandwidth.
 
-### Organisation du dépôt
+### Repository layout
 
 ```
-diskmedic.c                 Source unique (CLI, SMART ATA/NVMe/SAS, E/S disque, scan, TUI)
+diskmedic.c                 Single source file (CLI, ATA/NVMe/SAS SMART, disk I/O, scan, TUI)
 Makefile                   make / make test / make test-loop / make clean
-tests/run_tests.sh         Tests sans root (options, codes de sortie, rendu SMART)
-tests/smart_fixture_test.c Rapports SMART ATA/NVMe/SAS générés à partir de données fabriquées
-tests/run_loop_tests.sh    Tests root sur disques virtuels (loop + device-mapper)
-tests/run_sector_tests.sh  Tests root 512n/512e/4Kn, SSD, TRIM et multi-disques (scsi_debug)
-tests/run_nvme_tests.sh    Tests root NVMe (nvme-loop + machine virtuelle QEMU)
-.github/workflows/ci.yml   CI GitHub Actions
-dist/                      Archive de release et SHA256SUMS (hors git, publiés dans les Releases)
-LICENSE                    Licence MIT
+tests/run_tests.sh         Tests without root (options, exit codes, SMART rendering)
+tests/smart_fixture_test.c ATA/NVMe/SAS SMART reports generated from fabricated data
+tests/run_loop_tests.sh    Root tests on virtual disks (loop + device-mapper)
+tests/run_sector_tests.sh  Root tests for 512n/512e/4Kn, SSD, TRIM and multi-disk (scsi_debug)
+tests/run_nvme_tests.sh    Root NVMe tests (nvme-loop + QEMU virtual machine)
+.github/workflows/ci.yml   GitHub Actions CI
+dist/                      Release archive and SHA256SUMS (not in git, published in Releases)
+LICENSE                    MIT license
 ```
 
-## Tests et CI
+## Tests and CI
 
-Les tests n'utilisent **jamais de disque réel**, seulement des fichiers, des loop devices et des disques SCSI virtuels en mémoire.
+The tests **never use a real disk**, only files, loop devices, in-memory virtual SCSI disks and emulated NVMe controllers.
 
-| Commande | Droits | Contenu |
+| Command | Privileges | Content |
 |---|---|---|
-| `make test` | utilisateur | Options, codes de sortie, rendu SMART sur données fabriquées (HDD/SSD SATA, NVMe, SAS), décodage SAT, absence de couleurs hors terminal, largeur ≤ 80 colonnes |
-| `sudo sh tests/run_loop_tests.sh` | root | Vérification, scan, réparation, écriture zéro et refus d'un disque monté, sur loop device. Secteurs illisibles simulés par `dm-error` et `dm-flakey`, secteurs lents par `dm-delay` |
-| `sudo sh tests/run_sector_tests.sh` | root | Mêmes opérations en 512n, 512e et 4Kn avec `scsi_debug`, qui se présente comme un SSD : refus de `--zero` et `--slow-repair` sans `--force`, TRIM refusé sans UNMAP puis réussi avec. Vérifie aussi le LBA exact signalé, qu'un seul secteur physique est réécrit, le nombre de lectures en échec, et le menu multi-disques piloté au clavier dans un pseudo-terminal (dont le choix TRIM sur SSD) |
-| `sudo sh tests/run_nvme_tests.sh` | root | **nvme-loop** (cible NVMe du noyau, sans Format ni Sanitize) : SMART, refus de `--zero` alors que le noyau dit le disque rotatif, refus de Secure Erase avant confirmation, TRIM. **QEMU** (machine virtuelle de quelques secondes, avec trois contrôleurs NVMe émulés) : Format NVM réellement exécuté sur des secteurs de 512 o et de 4 Kio (format conservé), et sur un contrôleur à deux namespaces (l'autre namespace reste intact) |
+| `make test` | user | Options, exit codes, SMART rendering on fabricated data (SATA HDD/SSD, NVMe, SAS), SAT decoding, no colors outside a terminal, width ≤ 80 columns |
+| `sudo sh tests/run_loop_tests.sh` | root | Verification, scan, repair, zero-fill and refusal of a mounted disk, on a loop device. Unreadable sectors simulated with `dm-error` and `dm-flakey`, slow sectors with `dm-delay` |
+| `sudo sh tests/run_sector_tests.sh` | root | The same operations in 512n, 512e and 4Kn with `scsi_debug`, which presents itself as an SSD: `--zero` and `--slow-repair` refused without `--force`, TRIM refused without UNMAP and then successful with it. Also checks the exact LBA reported, that a single physical sector is rewritten, the number of failed reads, and the keyboard-driven multi-disk menu in a pseudo-terminal (including the TRIM choice for SSDs) |
+| `sudo sh tests/run_nvme_tests.sh` | root | **nvme-loop** (the kernel's NVMe target, without Format or Sanitize): SMART, `--zero` refused, Secure Erase refused before confirmation, TRIM. **QEMU** (a virtual machine that boots in a few seconds, with three emulated NVMe controllers): Format NVM actually run on 512 B and 4 KiB sectors (format kept), and on a controller with two namespaces (the other namespace stays intact) |
 
-`make test-loop` lance les trois scripts root. Ceux-ci s'ignorent eux-mêmes (`SKIP`) si les droits, les modules du noyau ou les outils manquent.
+`make test-loop` runs the three root scripts. They skip themselves (`SKIP`) if privileges, kernel modules or tools are missing.
 
-Le choix de la méthode NVMe (Sanitize cryptographique ou par blocs, Format, cas à plusieurs namespaces) est aussi testé par `make test`, sur des données Identify fabriquées.
+The choice of the NVMe method (cryptographic or block Sanitize, Format, several namespaces) is also tested by `make test`, on fabricated Identify data.
 
-**Outils requis pour les tests root** :
+**Tools needed for the root tests**:
 
-- `util-linux` : `losetup`, `blockdev`, `script` ;
-- `dmsetup` (paquet `dmsetup` ou `device-mapper`) ;
-- `e2fsprogs` : `mkfs.ext4` ;
-- `coreutils` : `dd`, `md5sum` ;
-- `udevadm` ;
-- les modules noyau `dm-delay`, `dm-flakey` et `scsi_debug`.
+- `util-linux`: `losetup`, `blockdev`, `script`;
+- `dmsetup` (package `dmsetup` or `device-mapper`);
+- `e2fsprogs`: `mkfs.ext4`;
+- `coreutils`: `dd`, `md5sum`, `timeout`;
+- `udevadm`;
+- the kernel modules `dm-delay`, `dm-flakey` and `scsi_debug`.
 
-Sur Ubuntu, `scsi_debug` est fourni par `linux-modules-extra-$(uname -r)`.
+On Ubuntu, `scsi_debug` comes with `linux-modules-extra-$(uname -r)`.
 
-**Outils supplémentaires pour les tests NVMe** :
+**Additional tools for the NVMe tests**:
 
-- les modules noyau `nvmet` et `nvme-loop` (partie nvme-loop) ;
-- `qemu-system-x86`, `busybox-static`, `cpio`, `gzip` et la libc statique (partie QEMU) ;
-- un noyau invité avec le pilote NVMe intégré : `DISKMEDIC_TEST_KERNEL`, sinon le noyau WSL (`C:\Program Files\WSL\tools\kernel`), sinon `/boot/vmlinuz-$(uname -r)`. KVM est utilisé s'il est disponible ; sinon, l'émulation logicielle est plus lente mais fonctionne.
+- the kernel modules `nvmet` and `nvme-loop` (nvme-loop part);
+- `qemu-system-x86`, `busybox-static`, `cpio`, `gzip` and the static libc (QEMU part);
+- a guest kernel with the NVMe driver built in: `DISKMEDIC_TEST_KERNEL`, otherwise the WSL kernel (`C:\Program Files\WSL\tools\kernel`), otherwise `/boot/vmlinuz-$(uname -r)`. KVM is used when available; otherwise software emulation is slower but works.
 
-Sous Ubuntu : `sudo apt install qemu-system-x86 busybox-static cpio`.
+On Ubuntu: `sudo apt install qemu-system-x86 busybox-static cpio`.
 
-La **CI GitHub Actions** (`ubuntu-latest`) compile avec les avertissements traités comme erreurs, puis lance les quatre suites à chaque push et à chaque pull request.
+**GitHub Actions CI** (`ubuntu-latest`) builds with warnings treated as errors, then runs all four suites on every push and pull request.
 
-## Limites connues
+## Known limitations
 
-- **Secure Erase** : ATA Security Erase et, pour NVMe, Sanitize et Format NVM. ATA Sanitize (SATA) et FORMAT UNIT / SANITIZE (SAS) ne sont pas implémentés : l'option est refusée sur les disques SAS, sans rien modifier.
-- **Sanitize NVMe non testé sur matériel** : ni nvme-loop ni QEMU 8.2 n'émulent Sanitize. Son choix est testé sur données fabriquées, mais son exécution suit la spécification NVMe sans avoir été vérifiée sur un vrai disque. Format NVM, lui, est testé dans QEMU.
-- **Détection SSD** : elle repose sur ce que le firmware annonce. Un disque qui ne renseigne pas sa vitesse de rotation, derrière une passerelle USB par exemple, est jugé d'après le noyau, qui peut se tromper. Les rares disques durs NVMe seraient traités comme des SSD.
-- **`--zero`** écrit jusqu'à la taille vue par le noyau. Les zones cachées (HPA/DCO) et les blocs réservés du firmware ne sont pas atteints ; le Secure Erase, lui, les couvre en principe.
-- **Secteurs réalloués** : ils ne peuvent pas être « réparés ». Une réécriture peut seulement provoquer la réallocation d'un secteur *en attente*.
-- **Passerelles USB** : certains boîtiers ne transmettent ni les commandes ATA ni les pages SMART. Le rapport indique alors `INCONNU` plutôt que `SAIN`.
-- **Matériel testé** : SMART SAS et NVMe ont été validés sur données fabriquées, sur `scsi_debug`, sur nvme-loop et sur les contrôleurs NVMe émulés par QEMU, pas encore sur une large gamme de disques réels. Les retours accompagnés de la sortie de `smartctl -x` sont les bienvenus.
-- **Plate-forme** : Linux uniquement (ioctl `SG_IO`, `BLK*`, NVMe).
+- **Secure Erase**: ATA Security Erase and, for NVMe, Sanitize and Format NVM. ATA Sanitize (SATA) and FORMAT UNIT / SANITIZE (SAS) are not implemented: the option is refused on SAS disks, without modifying anything.
+- **NVMe Sanitize not tested on hardware**: neither nvme-loop nor QEMU 8.2 emulates Sanitize. Its selection is tested on fabricated data, but the command itself follows the NVMe specification without having been checked on a real disk. Format NVM, on the other hand, is tested in QEMU.
+- **SSD detection**: it relies on what the firmware reports. A disk that does not report its rotation rate, for example behind a USB bridge, is judged from the kernel's flag, which can be wrong. The rare NVMe hard disks would be treated as SSDs.
+- **`--zero`** writes up to the size seen by the kernel. Hidden areas (HPA/DCO) and blocks reserved by the firmware are not reached; Secure Erase should cover them.
+- **Reallocated sectors**: they cannot be "repaired". A rewrite can only trigger the reallocation of a *pending* sector.
+- **USB bridges**: some enclosures pass through neither ATA commands nor SMART pages. The report then says `UNKNOWN` rather than `HEALTHY`.
+- **Hardware tested**: SAS and NVMe SMART have been validated on fabricated data, on `scsi_debug`, on nvme-loop and on QEMU-emulated NVMe controllers, but not yet on a wide range of real disks. Feedback is welcome, ideally with the output of `smartctl -x`.
+- **Platform**: Linux only (`SG_IO`, `BLK*` and NVMe ioctls).
 
-## Licence
+## License
 
-Distribué sous **licence MIT** : voir [LICENSE](LICENSE).
+Released under the **MIT license**: see [LICENSE](LICENSE).
 
-Vous pouvez librement utiliser, copier, modifier, fusionner, publier, distribuer, sous-licencier et vendre ce logiciel, y compris dans un cadre commercial. La seule condition est de conserver la mention de copyright et le texte de la licence dans toute copie ou partie substantielle du code.
+You may freely use, copy, modify, merge, publish, distribute, sublicense and sell this software, including for commercial purposes. The only condition is to keep the copyright notice and the license text in all copies or substantial portions of the code.
 
-Le logiciel est fourni **« tel quel », sans aucune garantie**. Les auteurs ne sont pas responsables des pertes de données ni des dommages matériels qui pourraient résulter de son utilisation. Cela vaut tout particulièrement pour un outil capable d'effacer des disques.
+The software is provided **"as is", without any warranty**. The authors are not liable for any data loss or hardware damage that may result from its use. This applies especially to a tool that can erase disks.
