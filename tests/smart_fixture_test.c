@@ -77,7 +77,7 @@ int main(void) {
     put_attr(data, 7, 197, 200, 200, 3);       put_thr(thr, 7, 197, 0);
     put_attr(data, 8, 199, 200, 200, 12);      put_thr(thr, 8, 199, 0);
     printf("=== HDD\n"); fflush(stdout);
-    smart_print_ata(id, data, thr, 1, 0);
+    int r_hdd = smart_print_ata(id, data, thr, 1, 0);
 
     /* 2. Healthy SATA SSD. */
     memset(id, 0, sizeof(id)); memset(data, 0, sizeof(data));
@@ -93,7 +93,7 @@ int main(void) {
     put_attr(data, 4, 190, 63, 52, 37);
     put_attr(data, 5, 241, 99, 99, UINT64_C(94140625000));
     printf("=== SSD\n"); fflush(stdout);
-    smart_print_ata(id, data, NULL, -1, UINT64_C(1000204886016));
+    int r_ssd = smart_print_ata(id, data, NULL, -1, UINT64_C(1000204886016));
 
     /* 3. Healthy NVMe, 4. failing NVMe. */
     unsigned char ctrl[4096], log[512];
@@ -106,29 +106,36 @@ int main(void) {
     put_le(log + 32, 8, 24070312); put_le(log + 48, 8, 94140625);
     put_le(log + 112, 8, 1204); put_le(log + 128, 8, 23456); put_le(log + 144, 8, 12);
     printf("=== NVME\n"); fflush(stdout);
-    nvme_print(ctrl, log, UINT64_C(1000204886016));
+    int r_nvme = nvme_print(ctrl, log, UINT64_C(1000204886016));
     log[0] = 0x04; log[5] = 95; put_le(log + 160, 8, 5);
     printf("=== NVME_BAD\n"); fflush(stdout);
-    nvme_print(ctrl, log, UINT64_C(1000204886016));
+    int r_nvme_bad = nvme_print(ctrl, log, UINT64_C(1000204886016));
 
     /* 5. Failing SAS, healthy SAS, SAS without any health data. */
     sas_info_t si;
     sas_fixture(&si, 1);
     printf("=== SAS_BAD\n"); fflush(stdout);
-    sas_print(&si, UINT64_C(4000787030016));
+    int r_sas_bad = sas_print(&si, UINT64_C(4000787030016));
     sas_fixture(&si, 0);
     printf("=== SAS\n"); fflush(stdout);
-    sas_print(&si, UINT64_C(4000787030016));
+    int r_sas = sas_print(&si, UINT64_C(4000787030016));
     sas_init(&si);
     snprintf(si.vendor, sizeof(si.vendor), "JMicron"); snprintf(si.product, sizeof(si.product), "Generic");
     printf("=== SAS_NONE\n"); fflush(stdout);
-    sas_print(&si, 0);
+    int r_sas_none = sas_print(&si, 0);
 
     /* 6. Decoding of the SAT registers (SMART RETURN STATUS). */
     unsigned char desc[22] = {0x72, 0x01, 0x00, 0x1d, 0, 0, 0, 14,
                               0x09, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0x4f, 0, 0xc2, 0, 0x50};
     unsigned char fixed[18] = {0x70, 0, 0x01, 0, 0x50, 0, 0, 10, 0, 0, 0xf4, 0x2c, 0x00, 0x1d, 0, 0, 0, 0};
     ata_regs_t r;
+    /* Verdict returned by each report, and the matching --smart exit code. */
+    printf("=== STATUS\n");
+    printf("hdd=%d ssd=%d nvme=%d nvme_bad=%d sas_bad=%d sas=%d sas_none=%d\n",
+           r_hdd, r_ssd, r_nvme, r_nvme_bad, r_sas_bad, r_sas, r_sas_none);
+    printf("exit: healthy=%d warning=%d critical=%d unknown=%d error=%d\n", smart_exit_code(SEV_OK),
+           smart_exit_code(SEV_WARN), smart_exit_code(SEV_CRIT), smart_exit_code(SEV_UNKNOWN), smart_exit_code(-1));
+
     printf("=== SENSE\n");
     int ok = parse_ata_sense(desc, sizeof(desc), &r);
     printf("desc valid=%d mid=%02x high=%02x\n", ok, r.lba_mid, r.lba_high);

@@ -91,6 +91,33 @@ if command -v dmsetup >/dev/null 2>&1; then
     else echo "  SKIP (device-mapper unavailable)"; DM=""; fi
 else echo "  SKIP (dmsetup missing)"; fi
 
+echo "- transient read error (pass 1 only): exact LBAs logged, scan fails"
+if command -v dmsetup >/dev/null 2>&1; then
+    attach 64M
+    S=$(blockdev --getsz "$LOOP")
+    DM="diskmedic-transient-$$"
+    BADL=122880   # block 60; blocks 0-59 are delayed by 10 ms so that pass 2 reaches it ~600 ms after it starts
+    if printf '0 %s delay %s 0 10\n%s 8 error\n%s %s linear %s %s\n' "$BADL" "$LOOP" "$BADL" $((BADL + 8)) \
+        $((S - BADL - 8)) "$LOOP" $((BADL + 8)) | dmsetup create "$DM" 2>/dev/null; then
+        D="/dev/mapper/$DM"
+        set_rotational "$D" 1
+        : >"$T/err"
+        ( set +e; "$BIN" "$D" --scan-slow --log "$T/t.csv" </dev/null >"$T/out" 2>"$T/err"; echo $? >"$T/rc" ) &
+        j=0; while ! grep -q 'Pass 2/2' "$T/err" && [ "$j" -lt 1200 ]; do sleep 0.05; j=$((j + 1)); done
+        # Pass 2 has started: the error disappears (healthy table loaded and swapped in).
+        printf '0 %s delay %s 0 10\n%s %s linear %s %s\n' "$BADL" "$LOOP" "$BADL" $((S - BADL)) "$LOOP" "$BADL" \
+            | dmsetup load "$DM" && dmsetup suspend "$DM" && dmsetup resume "$DM"
+        wait
+        [ "$(cat "$T/rc")" -eq 1 ] || fail "exit $(cat "$T/rc") instead of 1 for a scan with a transient read error"
+        grep -q 'transient read errors: 1' "$T/out" || fail "transient read error not counted"
+        grep -q 'read error on pass 1 only, readable on pass 2' "$T/out" || fail "transient read error not reported"
+        grep -q '"122880","TRANSIENT READ ERROR' "$T/t.csv" || fail "CSV log: transient error line missing"
+        [ "$(grep -c '"DEFECTIVE: read failed","NONE"' "$T/t.csv")" -eq 8 ] || fail "CSV log: 8 LBAs expected for the pass 1 error"
+        for l in 122880 122887; do grep -q "\"$l\",\"DEFECTIVE" "$T/t.csv" || fail "CSV log: LBA $l missing"; done
+        dmsetup remove --retry "$DM"; DM=""
+    else echo "  SKIP (dm-delay target unavailable)"; DM=""; fi
+else echo "  SKIP (dmsetup missing)"; fi
+
 echo "- simulated slow sectors (dm-delay): location and targeted rewrite"
 if command -v dmsetup >/dev/null 2>&1; then
     attach 64M
@@ -110,6 +137,7 @@ if command -v dmsetup >/dev/null 2>&1; then
         run "YES" 0 "$D" --slow-repair --log "$T/d.csv"
         [ "$before" = "$(md5sum <"$D")" ] || fail "slow-repair modified the data"
         [ "$(grep -c 'REWRITE VERIFIED, STILL SLOW' "$T/d.csv")" -eq 17 ] || fail "deferred check: 17 zones still slow expected"
+        grep -q '"21120","SLOW: zone LBA 21120-21247 (64 KiB)' "$T/d.csv" || fail "CSV log: slow zone range missing"
         dmsetup remove --retry "$DM"; DM=""
     else echo "  SKIP (dm-delay target unavailable)"; DM=""; fi
 else echo "  SKIP (dmsetup missing)"; fi
@@ -124,7 +152,12 @@ if command -v dmsetup >/dev/null 2>&1; then
         "$LOOP" "$LOOP" $((S - 10256)) "$LOOP" | dmsetup create "$DM" 2>/dev/null; then
         set_rotational "/dev/mapper/$DM" 1
         # Reads keep failing after the write: verification fails (exit 1), as expected.
-        run "YES" 1 "/dev/mapper/$DM" --slow-repair
+        run "YES" 1 "/dev/mapper/$DM" --slow-repair --log "$T/f.csv"
+        for l in 10248 10249 10250 10251 10252 10253 10254 10255; do
+            grep -q "\"$l\",\"DEFECTIVE: read failed\",\"PENDING\"" "$T/f.csv" || fail "CSV log: LBA $l missing (pass 1)"
+            grep -q "\"$l\",\"DEFECTIVE: read failed\",\"FAILED: verification" "$T/f.csv" || fail "CSV log: final outcome of LBA $l missing"
+        done
+        [ "$(grep -c '"DEFECTIVE: read failed","PENDING"' "$T/f.csv")" -eq 8 ] || fail "CSV log: each lost LBA must be logged once on detection"
         grep -q 'unreadable: 1 (unreadable sectors: 8)' "$T/out" || fail "8 unreadable sectors expected"
         dmsetup remove --retry "$DM"; DM=""; sync
         changed=$(cmp -l "$T/orig.img" "$T/disk.img" | awk '{print int(($1-1)/512)}' | sort -un | tr '\n' ' ')

@@ -74,8 +74,8 @@ Download the archive and `SHA256SUMS` from the [Releases](../../releases/latest)
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing   # optional: integrity check
-tar -xzf diskmedic-1.11.0-linux-x86_64.tar.gz
-cd diskmedic-1.11.0-linux-x86_64
+tar -xzf diskmedic-1.12.0-linux-x86_64.tar.gz
+cd diskmedic-1.12.0-linux-x86_64
 sudo ./diskmedic --help
 ```
 
@@ -142,8 +142,14 @@ Only one operation is accepted per run.
 | `0` | Success |
 | `1` | Error, refused operation (SSD, Secure Erase not possible, TRIM not supported), unreadable sectors found, or at least one failed disk (multi-disk mode) |
 | `2` | Invalid options, missing `YES` confirmation, or TUI mode without a terminal |
+| `3` / `4` / `5` | `--smart` only: the report was read, and its verdict is WARNING / CRITICAL / UNKNOWN (`0` = HEALTHY) |
 
 **CSV log**: it has the columns `timestamp_iso8601,device,operation,LBA,status,action`. LBAs are expressed in logical sectors.
+
+- Every unreadable LBA is logged on its own line as soon as it is found, on pass 1 or pass 2 of a scan.
+- A block that fails on pass 1 but reads fine on pass 2 gets a `TRANSIENT READ ERROR` line; the scan then ends with exit code `1`.
+- After `--slow-repair`, each lost LBA gets a second line with its final outcome (`REWRITE VERIFIED…` or `FAILED…`).
+- A slow zone is logged with its LBA range (`SLOW: zone LBA 21120-21247 (64 KiB) …`).
 
 ## Interactive interface (TUI)
 
@@ -188,7 +194,7 @@ In a small window, the display switches to two lines per disk.
 
 - **Interrupting**: `q` or Ctrl+C, then `y` to confirm. The summary shows the step and percentage each disk had reached. A Secure Erase cannot be interrupted, because the disk's firmware runs it.
 - **Logs**: a `diskmedic-YYYYMMDD-HHMMSS/` directory is created in the current directory (or in `/tmp`). It holds one `sdX.log` per disk, plus an `sdX.csv` for verification and scans. Under `sudo`, the files are given to the calling user.
-- **End**: the normal terminal shows each disk's report, then an `[OK]` / `[FAILED]` / `[INTERRUPTED]` summary.
+- **End**: the normal terminal shows each disk's report, then an `[OK]` / `[FAILED]` / `[INTERRUPTED]` summary. For SMART, a disk whose verdict is not healthy shows as `[WARNING]`, `[CRITICAL]` or `[UNKNOWN]`, and the dashboard counts it as a SMART alert.
 - **Safety**: before a destructive operation, the list of target disks is shown, with the planned operation for each one. If a single one of them is mounted or in use, nothing is started.
 - **SSDs in the selection**: for a zero-fill, DiskMedic lists the SSDs and offers `t` (TRIM on the SSDs, zeros on the hard disks), `z` (zeros everywhere) or cancellation. For a slow-block repair, it offers `s` (scan only on the SSDs), `r` (repair everywhere) or cancellation.
 
@@ -198,7 +204,7 @@ With `--tui /dev/sdX`, the menu covers a single disk. Its header shows the disk'
 - NVMe: health, temperature, remaining life;
 - SAS: firmware assessment, temperature.
 
-It also shows the capacity, the sector format and the media type (SSD or hard disk). On an SSD, choices 4 and 5 offer the suitable alternative (scan only, TRIM) or the operation anyway.
+It also shows the capacity, the sector format and the media type (SSD or hard disk). On an SSD, choices 4 and 5 offer the suitable alternative (scan only, TRIM) or the operation anyway. Verification, slow scan and repair write their CSV log to a new `diskmedic-YYYYMMDD-HHMMSS/` directory, as in multi-disk mode.
 
 ## Technical details
 
@@ -228,7 +234,7 @@ It also shows the capacity, the sector format and the media type (SSD or hard di
 ### Slow-block scan algorithm
 
 1. **Pass 1, timing**: each 1 MiB block is timed. The median is computed over a sample of at most 1 million measurements, and the threshold is median × `--slow-factor`, with a minimum gap of 5 ms above the median. Without this floor, on very fast media (NVMe, median below 1 ms), ordinary system pauses would be enough to exceed the threshold. A re-read on a hard disk costs at least one platter revolution (8 to 11 ms), so it is still detected.
-2. **Pass 2, confirmation**: a block is kept only if it exceeds the threshold on both passes. A block that is slow on one pass only is classified as *intermittent* and is never rewritten.
+2. **Pass 2, confirmation**: a block is kept only if it exceeds the threshold on both passes. A block that is slow on one pass only is classified as *intermittent* and is never rewritten. A read error is located sector by sector as soon as it occurs, on pass 1 or 2; a block that fails on pass 1 and reads fine on pass 2 is reported as a *transient read error*.
 3. **Location**: each confirmed block is read again in 64 KiB zones (or zones of the physical sector size, if larger), from the last zone to the first. Beforehand, 64 MiB are read elsewhere on the disk to flush its cache. Each zone is compared to a healthy reference zone: a zone is slow if it carries at least half of the block's delay, or if it exceeds the factor × the reference with a gap of at least 1 ms.
 4. **Targeted rewrite** (`--slow-repair`): only the slow zones are rewritten, with their own data, then read back and compared. In an unreadable block, only the physical sectors that contain a lost sector are rewritten; the lost part is replaced with zeros, which lets the firmware reallocate the sector.
 5. **Deferred check**: each rewritten zone is timed again after another cache flush, then classified as `FAST` or `STILL SLOW`.
@@ -269,8 +275,8 @@ The tests **never use a real disk**, only files, loop devices, in-memory virtual
 | Command | Privileges | Content |
 |---|---|---|
 | `make test` | user | Options, exit codes, SMART rendering on fabricated data (SATA HDD/SSD, NVMe, SAS), SAT decoding, no colors outside a terminal, width ≤ 80 columns |
-| `sudo sh tests/run_loop_tests.sh` | root | Verification, scan, repair, zero-fill and refusal of a mounted disk, on a loop device. Unreadable sectors simulated with `dm-error` and `dm-flakey`, slow sectors with `dm-delay` |
-| `sudo sh tests/run_sector_tests.sh` | root | The same operations in 512n, 512e and 4Kn with `scsi_debug`, which presents itself as an SSD: `--zero` and `--slow-repair` refused without `--force`, TRIM refused without UNMAP and then successful with it. Also checks the exact LBA reported, that a single physical sector is rewritten, the number of failed reads, and the keyboard-driven multi-disk menu in a pseudo-terminal (including the TRIM choice for SSDs) |
+| `sudo sh tests/run_loop_tests.sh` | root | Verification, scan, repair, zero-fill and refusal of a mounted disk, on a loop device. Unreadable sectors simulated with `dm-error` and `dm-flakey`, slow sectors with `dm-delay`, and a transient read error (the error table is swapped for a healthy one between the two passes). Checks the CSV log line by line |
+| `sudo sh tests/run_sector_tests.sh` | root | The same operations in 512n, 512e and 4Kn with `scsi_debug`, which presents itself as an SSD: `--zero` and `--slow-repair` refused without `--force`, TRIM refused without UNMAP and then successful with it. Also checks the exact LBA reported, that a single physical sector is rewritten, the number of failed reads, and the keyboard-driven multi-disk menu in a pseudo-terminal (including the TRIM choice for SSDs), the CSV log of the single-disk menu, and a disk that predicts a failure (test mode enabled with `sdparm`): exit code `4` and `[CRITICAL]` in the summary |
 | `sudo sh tests/run_nvme_tests.sh` | root | **nvme-loop** (the kernel's NVMe target, without Format or Sanitize): SMART, `--zero` refused, Secure Erase refused before confirmation, TRIM. **QEMU** (a virtual machine that boots in a few seconds, with three emulated NVMe controllers): Format NVM actually run on 512 B and 4 KiB sectors (format kept), and on a controller with two namespaces (the other namespace stays intact) |
 
 `make test-loop` runs the three root scripts. They skip themselves (`SKIP`) if privileges, kernel modules or tools are missing.
@@ -284,6 +290,7 @@ The choice of the NVMe method (cryptographic or block Sanitize, Format, several 
 - `e2fsprogs`: `mkfs.ext4`;
 - `coreutils`: `dd`, `md5sum`, `timeout`;
 - `udevadm`;
+- `sdparm` (optional: SMART CRITICAL test);
 - the kernel modules `dm-delay`, `dm-flakey` and `scsi_debug`.
 
 On Ubuntu, `scsi_debug` comes with `linux-modules-extra-$(uname -r)`.

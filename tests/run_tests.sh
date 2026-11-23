@@ -6,7 +6,7 @@ trap 'rm -rf "$TMPDIR_TEST"' EXIT HUP INT TERM
 BIN="$TMPDIR_TEST/diskmedic"
 cc -O2 -Wall -Wextra -Werror -std=c99 "$ROOT/diskmedic.c" -o "$BIN"
 "$BIN" --version >"$TMPDIR_TEST/version.txt"
-grep -q 'DiskMedic 1.11.0' "$TMPDIR_TEST/version.txt"
+grep -q 'DiskMedic 1.12.0' "$TMPDIR_TEST/version.txt"
 "$BIN" --help >"$TMPDIR_TEST/help.txt"
 grep -q -- '--smart' "$TMPDIR_TEST/help.txt"
 grep -q -- '--secure-erase' "$TMPDIR_TEST/help.txt"
@@ -91,6 +91,8 @@ expect_in SAS 'Health (firmware assessment): OK'
 expect_in SAS 'VERDICT: HEALTHY'
 expect_in SAS_NONE 'No readable health data'
 expect_in SAS_NONE 'VERDICT: UNKNOWN'
+expect_in STATUS 'hdd=2 ssd=0 nvme=0 nvme_bad=2 sas_bad=2 sas=0 sas_none=3'
+expect_in STATUS 'exit: healthy=0 warning=3 critical=4 unknown=5 error=1'
 expect_in SENSE 'desc valid=1 mid=4f high=c2'
 expect_in SENSE 'fixed valid=1 mid=f4 high=2c'
 expect_in ERASE 'crypto+block: 0 Sanitize, cryptographic erase'

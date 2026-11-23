@@ -30,7 +30,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 
-#define DISKMEDIC_VERSION "1.11.0"
+#define DISKMEDIC_VERSION "1.12.0"
 #define BUF_SIZE (1024U * 1024U)
 #define ATA_TIMEOUT_MS (24U * 60U * 60U * 1000U)
 #define ATA_IDENTIFY 0xEC
@@ -63,7 +63,8 @@ enum {
     SB_UNREADABLE,      /* read error */
     SB_CONFIRMED,       /* slow on passes 1 and 2, slowness located */
     SB_INTERMITTENT,    /* slow on one pass only: not confirmed */
-    SB_NOT_REPRODUCED   /* slow on both passes but not during location */
+    SB_NOT_REPRODUCED,  /* slow on both passes but not during location */
+    SB_TRANSIENT        /* read error on pass 1, readable again on pass 2 */
 };
 typedef struct { uint64_t index; double ms, ms1; int status; } slow_block_t;
 
@@ -738,7 +739,11 @@ static int smart_health(int fd) {
 
 /* ---------- Human-readable formatting ---------- */
 
-enum { SEV_OK = 0, SEV_WARN = 1, SEV_CRIT = 2 };
+enum { SEV_OK = 0, SEV_WARN = 1, SEV_CRIT = 2, SEV_UNKNOWN = 3 };
+/* Exit code of --smart (and of a multi-disk SMART job): 0 healthy, 3 warning, 4 critical, 5 unknown, 1 error. */
+static int smart_exit_code(int sev) {
+    return sev < 0 ? 1 : sev == SEV_WARN ? 3 : sev == SEV_CRIT ? 4 : sev == SEV_UNKNOWN ? 5 : 0;
+}
 static int color_mode = -1;
 static int color_on(void) {
     if (color_mode < 0) {
@@ -1199,8 +1204,7 @@ static int nvme_report(int fd, uint64_t bytes) {
         fprintf(stderr, "Cannot read the NVMe SMART log: %s\n", strerror(errno));
         goto out;
     }
-    nvme_print(have_ctrl ? ctrl : NULL, log, bytes);
-    rc = 0;
+    rc = nvme_print(have_ctrl ? ctrl : NULL, log, bytes);
 out:
     free(ctrl); free(log); return rc;
 }
@@ -1379,7 +1383,7 @@ static int sas_print(const sas_info_t *si, uint64_t bytes) {
     if (!known) {
         printf("\nNo readable health data (USB bridge or controller that does not pass SCSI pages through).\n");
         printf("\n%sVERDICT: UNKNOWN%s\n", c_bold(), c_reset());
-        return SEV_OK;
+        return SEV_UNKNOWN;
     }
     /* Summary. */
     char summary[384] = "", part[128];
@@ -1560,7 +1564,7 @@ static int smart_report(int fd) {
     if (identify_quiet(fd, id) < 0) {
         /* No ATA response: SAS/SCSI disk (LOG SENSE pages)? */
         sas_info_t si;
-        if (sas_collect(fd, &si) == 0) { sas_print(&si, (uint64_t)bytes); fflush(stdout); return 0; }
+        if (sas_collect(fd, &si) == 0) { int r = sas_print(&si, (uint64_t)bytes); fflush(stdout); return r; }
         fprintf(stderr, "No ATA IDENTIFY, SCSI INQUIRY or NVMe response: SMART is not available for this device.\n");
         return -1;
     }
@@ -1573,9 +1577,9 @@ static int smart_report(int fd) {
     if (smart_read_data(fd, data) < 0) { fprintf(stderr, "SMART READ DATA failed (incompatible USB bridge?).\n"); return -1; }
     int have_thr = smart_read_thresholds(fd, thr) == 0;
     int health = smart_health(fd);
-    smart_print_ata(id, data, have_thr ? thr : NULL, health, (uint64_t)bytes);
+    int r = smart_print_ata(id, data, have_thr ? thr : NULL, health, (uint64_t)bytes);
     fflush(stdout);
-    return 0;
+    return r;
 }
 /*
  * Temporary ATA password, deliberately known and displayed: if the erase is
@@ -2110,6 +2114,17 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
         double t;
         int r = timed_pread(&io, buf, n, off, &t);
         if (pass1) pass1[i] = r == 0 ? (float)t : -1.0f;
+        if (r != 0) {
+            /*
+             * Read error on pass 1: locate and log the exact LBAs right away, so that an error
+             * that does not come back on pass 2 (transient) is not lost.
+             */
+            errors++;
+            fprintf(stderr, "\nRead error in block %" PRIu64 " (pass 1); checking sector by sector…\n", i);
+            uint64_t bad = read_sectors(&io, buf, n, off, op, repair ? "PENDING" : "NONE", 1, NULL);
+            if (bad == UINT64_MAX) goto out;
+            bad_sectors += bad;
+        }
         if (r == 0) {
             nvalid++;
             if (nsample < sample_cap) sample[nsample++] = t;
@@ -2140,14 +2155,18 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
         uint64_t off = i * (uint64_t)BUF_SIZE;
         size_t n = (size - off > BUF_SIZE) ? BUF_SIZE : (size_t)(size - off);
         double ms;
+        int failed1 = pass1 && pass1[i] < 0;
         if (timed_pread(&io, buf, n, off, &ms) < 0) {
-            ms = -1.0; errors++;
-            fprintf(stderr, "\nRead error in block %" PRIu64 "; checking sector by sector…\n", i);
-            uint64_t bad = read_sectors(&io, buf, n, off, op, repair ? "PENDING" : "NONE", 1, NULL);
-            if (bad == UINT64_MAX) goto out;
-            bad_sectors += bad;
+            ms = -1.0;
+            if (!failed1) {   /* new error: locate and log it (already done on pass 1 otherwise) */
+                errors++;
+                fprintf(stderr, "\nRead error in block %" PRIu64 " (pass 2); checking sector by sector…\n", i);
+                uint64_t bad = read_sectors(&io, buf, n, off, op, repair ? "PENDING" : "NONE", 1, NULL);
+                if (bad == UINT64_MAX) goto out;
+                bad_sectors += bad;
+            }
         }
-        if (ms < 0 || ms > threshold) {
+        if (ms < 0 || ms > threshold || failed1) {
             if (nslow == cap) {
                 size_t nc = cap ? cap * 2 : 16;
                 if (nc < cap || nc > SIZE_MAX / sizeof(*slow)) { fprintf(stderr, "Slow block list too large.\n"); goto out; }
@@ -2156,7 +2175,7 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
                 slow = p; cap = nc;
             }
             double ms1 = pass1 ? (double)pass1[i] : -2.0;
-            int status = ms < 0 ? SB_UNREADABLE
+            int status = ms < 0 ? SB_UNREADABLE : failed1 ? SB_TRANSIENT
                        : (!pass1 || ms1 < 0 || ms1 > threshold) ? SB_CONFIRMED : SB_INTERMITTENT;
             slow[nslow++] = (slow_block_t){.index = i, .ms = ms, .ms1 = ms1, .status = status};
         }
@@ -2262,16 +2281,18 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
     }
 
     /* Report and log. */
-    size_t n_unread = 0, n_conf = 0, n_inter = 0;
+    size_t n_unread = 0, n_conf = 0, n_inter = 0, n_trans = 0;
     size_t z_ok = 0, z_still = 0, z_fail = 0, u_fixed = 0, u_fail = 0;
     uint64_t zeroed = 0;
     for (size_t k = 0; k < nslow; k++) {
         n_unread += slow[k].status == SB_UNREADABLE;
         n_conf += slow[k].status == SB_CONFIRMED;
         n_inter += slow[k].status == SB_INTERMITTENT || slow[k].status == SB_NOT_REPRODUCED;
+        n_trans += slow[k].status == SB_TRANSIENT;
     }
     printf("Reported blocks: %zu — confirmed slow: %zu, intermittent (not confirmed): %zu, unreadable: %zu "
-           "(unreadable sectors: %" PRIu64 ").\n", nslow, n_conf, n_inter, n_unread, bad_sectors);
+           "(unreadable sectors: %" PRIu64 "), transient read errors: %zu.\n",
+           nslow, n_conf, n_inter, n_unread, bad_sectors, n_trans);
     size_t zi = 0;
     for (size_t k = 0; k < nslow; k++) {
         uint64_t off = slow[k].index * (uint64_t)BUF_SIZE;
@@ -2279,6 +2300,12 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
         char m1[32], m2[32], state[160], action[160];
         fmt_ms(m1, sizeof(m1), slow[k].ms1); fmt_ms(m2, sizeof(m2), slow[k].ms);
         printf("  block %" PRIu64 " (LBA %" PRIu64 "): ", slow[k].index, off / log_sector_size);
+        if (slow[k].status == SB_TRANSIENT) {
+            printf("read error on pass 1 only, readable on pass 2 (%s) — not rewritten\n", m2);
+            snprintf(state, sizeof(state), "TRANSIENT READ ERROR: pass 1 failed, pass 2 read in %s", m2);
+            if (log_event(op, off / log_sector_size, state, repair ? "NONE (readable again, not rewritten)" : "NONE") < 0) goto out;
+            continue;
+        }
         if (slow[k].status == SB_INTERMITTENT || slow[k].status == SB_NOT_REPRODUCED) {
             if (slow[k].status == SB_INTERMITTENT)
                 snprintf(state, sizeof(state), "INTERMITTENT: pass 1 %s, pass 2 %s", m1, m2);
@@ -2324,8 +2351,14 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
                 u_fixed++; zeroed += bad;
             }
             printf(" — %s\n", action);
-            snprintf(state, sizeof(state), "DEFECTIVE: read failed (%" PRIu64 " sector(s))", bad);
-            if (log_event(op, off / log_sector_size, state, action) < 0) goto out;
+            /* Final outcome logged for each lost LBA (the pass 1/2 entries say PENDING). */
+            if (!bad) {
+                if (log_event(op, off / log_sector_size, "DEFECTIVE: read failed earlier, readable now", action) < 0) goto out;
+            } else {
+                for (size_t idx = 0; idx < n / log_sector_size; idx++)
+                    if ((badmap[idx / 8] & (1U << (idx % 8))) &&
+                        log_event(op, off / log_sector_size + idx, "DEFECTIVE: read failed", action) < 0) goto out;
+            }
             continue;
         }
         printf("slow (pass 1: %s, pass 2: %s)\n", m1, m2);
@@ -2342,8 +2375,8 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
             else { snprintf(action, sizeof(action), "REWRITE VERIFIED, FAST (%.3f ms)", z->t_after); z_ok++; }
             if (repair) printf(" → %s", action);
             printf("\n");
-            snprintf(state, sizeof(state), "SLOW: zone %zu KiB %.3f ms (healthy zone %.3f ms); block %s / %s",
-                     z->len / 1024, z->t, z->base, m1, m2);
+            snprintf(state, sizeof(state), "SLOW: zone LBA %" PRIu64 "-%" PRIu64 " (%zu KiB) %.3f ms (healthy zone %.3f ms); block %s / %s",
+                     lba, lba + nsec - 1, z->len / 1024, z->t, z->base, m1, m2);
             if (log_event(op, lba, state, action) < 0) goto out;
         }
     }
@@ -2352,7 +2385,7 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
                "unreadable blocks repaired=%zu, failures=%zu, sectors replaced with zeros=%" PRIu64 "; "
                "intermittent blocks not rewritten=%zu.\n",
                z_ok, z_still, z_fail, u_fixed, u_fail, zeroed, n_inter);
-    rc = repair ? ((z_fail || u_fail) ? -1 : 0) : (errors ? -1 : 0);
+    rc = repair ? ((z_fail || u_fail || n_trans) ? -1 : 0) : (errors ? -1 : 0);
 out:
     free(zones); free(slow); free(pass1); free(sample); free(buf); free(tmp); dio_close(&io); return rc;
 }
@@ -2565,6 +2598,21 @@ static size_t scan_disks(disk_info_t disks[MAX_DISKS]) {
     return count;
 }
 
+static int make_log_dir(char *out, size_t n);
+static void give_to_sudo_user(const char *path);
+/* Single-disk menu: CSV log in a new diskmedic-YYYYMMDD-HHMMSS/ directory, like the multi-disk mode. */
+static void tui_open_csv(const char *dev) {
+    static char path[PATH_MAX + 300];
+    char dir[PATH_MAX];
+    log_entries = 0; log_failed = 0;
+    if (make_log_dir(dir, sizeof(dir)) < 0) {
+        fprintf(stderr, "Cannot create the log directory (%s): no CSV log for this operation.\n", strerror(errno));
+        return;
+    }
+    const char *base = strrchr(dev, '/');
+    snprintf(path, sizeof(path), "%s/%.255s.csv", dir, base ? base + 1 : dev);
+    if (open_log(path) == 0) give_to_sudo_user(path);
+}
 static int tui_menu(int fd, uint64_t size, const char *dev) {
     struct termios saved, raw;
     int raw_enabled = isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &saved) == 0;
@@ -2664,14 +2712,17 @@ static int tui_menu(int fd, uint64_t size, const char *dev) {
             else if(c=='6' && is_nvme && nvme_erase_preview(fd)<0) ret=-1;
             else if((claim=claim_device(dev))<0) ret=-1;
             else if(!confirm_mutation()) { fprintf(stderr,"Confirmation declined.\n"); }
-            else if(c=='4') ret=slow_scan(fd,size,4.0,1);
+            else if(c=='4') { tui_open_csv(dev); ret=slow_scan(fd,size,4.0,1); close_log(); if(log_failed) ret=-1; }
             else if(c=='5') ret=zero_disk(fd,size);
             else if(c=='6') ret=secure_erase_any(fd,size);
             else if(c=='7') ret=trim_disk(fd,size);
             if(claim>=0) close(claim);
             if(raw_enabled) tcsetattr(STDIN_FILENO,TCSANOW,&raw);
-        } else if(c=='2') ret=verify_disk(fd,size);
-        else ret=slow_scan(fd,size,4.0,0);
+        } else {
+            tui_open_csv(dev);
+            ret = c=='2' ? verify_disk(fd,size) : slow_scan(fd,size,4.0,0);
+            close_log(); if(log_failed) ret=-1;
+        }
         fflush(stdout);
         fprintf(stderr,"\nOperation finished (code %d). Press any key…",ret); fflush(stderr); getchar(); ret=0;
     }
@@ -2682,7 +2733,9 @@ static int tui_menu(int fd, uint64_t size, const char *dev) {
 
 /* ---------- Parallel multi-disk execution and full-screen dashboard ---------- */
 enum { JOB_RUNNING, JOB_DONE };
-enum { JR_OK, JR_FAIL, JR_KILLED, JR_NOT_STARTED };
+enum { JR_OK, JR_FAIL, JR_KILLED, JR_NOT_STARTED, JR_WARN, JR_CRIT, JR_UNKNOWN };
+/* Finished jobs whose operation completed but whose SMART verdict is not healthy. */
+static int jr_alert(int status) { return status == JR_WARN || status == JR_CRIT || status == JR_UNKNOWN; }
 typedef struct {
     size_t disk;                        /* index in tui_disks */
     char dev[PATH_MAX + 128];
@@ -2841,6 +2894,9 @@ static const char *job_label(const job_t *j, const char **color) {
     if (j->state == JOB_RUNNING) { *color = "\033[1;36m"; return "RUNNING"; }
     if (j->status == JR_OK) { *color = "\033[1;32m"; return "OK"; }
     if (j->status == JR_KILLED) { *color = "\033[1;33m"; return "INTERRUPTED"; }
+    if (j->status == JR_WARN) { *color = "\033[1;33m"; return "WARNING"; }
+    if (j->status == JR_CRIT) { *color = "\033[1;31m"; return "CRITICAL"; }
+    if (j->status == JR_UNKNOWN) { *color = "\033[1;33m"; return "UNKNOWN"; }
     *color = "\033[1;31m"; return "FAILED";
 }
 static void dash_draw(const job_t *jobs, size_t njobs, const worker_slot_t *slots, const char *op_name,
@@ -2854,10 +2910,11 @@ static void dash_draw(const job_t *jobs, size_t njobs, const worker_slot_t *slot
     clock_gettime(CLOCK_MONOTONIC, &now);
     unsigned rows = terminal_rows();
     char left[PATH_MAX + 512], right[160], el[32];
-    size_t running = 0, ok = 0, bad = 0;
+    size_t running = 0, ok = 0, bad = 0, alerts = 0;
     for (size_t k = 0; k < njobs; k++) {
         if (jobs[k].state == JOB_RUNNING) running++;
         else if (jobs[k].status == JR_OK) ok++;
+        else if (jr_alert(jobs[k].status)) alerts++;
         else bad++;
     }
     fputs("\033[H", mf);
@@ -2883,7 +2940,7 @@ static void dash_draw(const job_t *jobs, size_t njobs, const worker_slot_t *slot
         format_eta(elapsed_seconds(&j->start, run ? &now : &j->end), el, sizeof(el));
         double pct = has_prog ? 100.0 * (double)w.done / (double)w.total : 0.0;
         if (pct > 100.0) pct = 100.0;
-        if (!run && j->status == JR_OK) { pct = 100.0; }
+        if (!run && (j->status == JR_OK || jr_alert(j->status))) { pct = 100.0; }
         char pcts[16], sz[32], inst[32], avg[32], eta[32], tail[256], badtxt[64];
         fmt_dec(pcts, sizeof(pcts), pct, 1);
         fmt_bytes(sz, sizeof(sz), (double)d->bytes);
@@ -2926,7 +2983,10 @@ static void dash_draw(const job_t *jobs, size_t njobs, const worker_slot_t *slot
         print_tui_line(left);
     }
     print_tui_rule('M', 'M');
-    snprintf(left, sizeof(left), "Running: %zu · Finished: %zu (OK: %zu, failed: %zu)", running, ok + bad, ok, bad);
+    if (alerts)
+        snprintf(left, sizeof(left), "Running: %zu · Finished: %zu (OK: %zu, SMART alerts: %zu, failed: %zu)",
+                 running, ok + alerts + bad, ok, alerts, bad);
+    else snprintf(left, sizeof(left), "Running: %zu · Finished: %zu (OK: %zu, failed: %zu)", running, ok + bad, ok, bad);
     print_tui_line(left);
     snprintf(left, sizeof(left), "Logs: %s", logdir);
     print_tui_line(left);
@@ -3186,9 +3246,11 @@ static int tui_multi(void) {
             if (!one) one = run_disk_operation(j->op, j->dev, op_mutates(j->op));
             close_log();
             if (log_failed) one = -1;
-            printf("\nResult: %s\n", one == 0 ? "OK" : "FAILED");
+            int code = j->op == 1 ? smart_exit_code(one) : one == 0 ? 0 : 1;
+            printf("\nResult: %s\n", code == 0 ? "OK" : code == 3 ? "WARNING" : code == 4 ? "CRITICAL" :
+                                     code == 5 ? "UNKNOWN" : "FAILED");
             fflush(stdout);
-            _exit(one == 0 ? 0 : 1);
+            _exit(code);
         }
         if (pid < 0) {
             fprintf(stderr, "fork: %s\n", strerror(errno));
@@ -3223,7 +3285,9 @@ static int tui_multi(void) {
                 if (jobs[k].pid != p || jobs[k].state != JOB_RUNNING) continue;
                 jobs[k].state = JOB_DONE;
                 clock_gettime(CLOCK_MONOTONIC, &jobs[k].end);
-                jobs[k].status = WIFEXITED(st) ? (WEXITSTATUS(st) == 0 ? JR_OK : JR_FAIL) : JR_KILLED;
+                int ec = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+                jobs[k].status = ec < 0 ? JR_KILLED : ec == 0 ? JR_OK : ec == 3 ? JR_WARN :
+                                 ec == 4 ? JR_CRIT : ec == 5 ? JR_UNKNOWN : JR_FAIL;
                 if (!draw) {
                     const char *c;
                     fprintf(stderr, "[%s] %s — %s\n", job_label(&jobs[k], &c), jobs[k].dev, op_label(jobs[k].op));
@@ -3358,7 +3422,7 @@ int main(int argc,char **argv) {
     }
     if(o.log_path && open_log(o.log_path)<0) { if(claim>=0) close(claim); close(fd); return 1; }
     int rc=0;
-    if(o.smart_only) rc=smart_report(fd)<0?1:0;
+    if(o.smart_only) rc=smart_exit_code(smart_report(fd));
     if(!rc && o.secure_erase) rc=secure_erase_any(fd,size)<0?1:0;
     if(!rc && o.zero) rc=zero_disk(fd,size)<0?1:0;
     if(!rc && o.trim) rc=trim_disk(fd,size)<0?1:0;
