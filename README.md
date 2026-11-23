@@ -226,9 +226,9 @@ Il indique aussi la capacité, le format de secteur et le type de support (SSD o
 
 ### Algorithme du scan de blocs lents
 
-1. **Passage 1, mesure** : chaque bloc de 1 Mio est chronométré. La médiane est calculée sur un échantillon de 1 million de mesures au plus, et le seuil vaut médiane × `--slow-factor`.
+1. **Passage 1, mesure** : chaque bloc de 1 Mio est chronométré. La médiane est calculée sur un échantillon de 1 million de mesures au plus, et le seuil vaut médiane × `--slow-factor`, avec un écart minimal de 5 ms au-dessus de la médiane. Sans ce plancher, sur un support très rapide (NVMe, médiane inférieure à 1 ms), les pauses ordinaires du système suffiraient à dépasser le seuil. Une relecture sur disque dur coûte au moins un tour de plateau (8 à 11 ms) et reste détectée.
 2. **Passage 2, confirmation** : un bloc n'est retenu que s'il dépasse le seuil aux deux passages. Un bloc lent à un seul passage est classé *intermittent* et n'est jamais réécrit.
-3. **Localisation** : chaque bloc confirmé est relu par zones de 64 Kio, ou de la taille du secteur physique si elle est plus grande, de la dernière zone à la première. Avant cela, 64 Mio sont lus ailleurs sur le disque pour vider son cache. Chaque zone est comparée à une zone saine de référence.
+3. **Localisation** : chaque bloc confirmé est relu par zones de 64 Kio, ou de la taille du secteur physique si elle est plus grande, de la dernière zone à la première. Une zone est lente si elle porte au moins la moitié du retard du bloc, ou si elle dépasse le facteur × la zone de référence avec au moins 1 ms d'écart. Avant cela, 64 Mio sont lus ailleurs sur le disque pour vider son cache. Chaque zone est comparée à une zone saine de référence.
 4. **Réécriture ciblée** (`--slow-repair`) : seules les zones lentes sont réécrites, avec leurs propres données, puis relues et comparées. Dans un bloc illisible, seuls les secteurs physiques qui contiennent un secteur perdu sont réécrits ; la partie perdue est remplacée par des zéros, ce qui permet au firmware de réallouer le secteur.
 5. **Contrôle différé** : chaque zone réécrite est rechronométrée après un nouveau vidage du cache, puis classée `RAPIDE` ou `TOUJOURS LENT`.
 

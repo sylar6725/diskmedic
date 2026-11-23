@@ -24,10 +24,18 @@ run() { # run <stdin> <exit attendu> <args…>
     set +e; printf '%s\n' "$input" | "$BIN" "$@" >"$T/out" 2>"$T/err"; got=$?; set -e
     [ "$got" -eq "$wanted" ] || fail "exit $got au lieu de $wanted pour : $*"
 }
+# Ces tests couvrent le chemin « disque dur » : le loop device est déclaré rotatif. Sinon, sur une
+# machine dont le fichier image est sur SSD, le noyau le dit non rotatif et DiskMedic le traite
+# (à juste titre) comme un SSD : écriture zéro et réparation lente seraient refusées.
+set_rotational() { # set_rotational <périphérique> <0|1>
+    b=$(basename "$(readlink -f "$1")")
+    echo "$2" >"/sys/block/$b/queue/rotational" 2>/dev/null || fail "queue/rotational non modifiable pour $b"
+}
 attach() { # attach <taille>
     [ -n "$LOOP" ] && losetup -d "$LOOP"
     rm -f "$T/disk.img"; truncate -s "$1" "$T/disk.img"
     LOOP=$(losetup -f --show "$T/disk.img")
+    set_rotational "$LOOP" 1
     dd if=/dev/urandom of="$LOOP" bs=64K count=$(( $(blockdev --getsize64 "$LOOP") / 65536 )) status=none
     sync
 }
@@ -47,6 +55,11 @@ grep -q 'lents confirmés : 0' "$T/out" || fail "faux positif confirmé sur disq
 ! grep -q 'REÉCRITURE' "$T/r.csv" || fail "réécriture sur disque sain"
 echo "- zero"; run "OUI" 0 "$LOOP" --zero
 [ "$(nonzero "$LOOP")" -eq 0 ] || fail "octets non nuls après --zero"
+echo "- non rotatif selon le noyau : zero refusé (SSD probable)"
+set_rotational "$LOOP" 0
+run "OUI" 1 "$LOOP" --zero
+grep -q 'support non rotatif selon le noyau' "$T/err" || fail "refus SSD (noyau) absent"
+set_rotational "$LOOP" 1
 
 echo "- disque monté refusé"
 if command -v mkfs.ext4 >/dev/null 2>&1; then
@@ -87,10 +100,12 @@ if command -v dmsetup >/dev/null 2>&1; then
     if printf '0 21120 linear %s 0\n21120 16 delay %s 21120 30\n21136 %s linear %s 21136\n61440 2048 delay %s 61440 30\n63488 %s linear %s 63488\n' \
         "$LOOP" "$LOOP" $((61440 - 21136)) "$LOOP" "$LOOP" $((S - 63488)) "$LOOP" | dmsetup create "$DM" 2>/dev/null; then
         D="/dev/mapper/$DM"
+        set_rotational "$D" 1
         run "" 0 "$D" --scan-slow
         grep -q 'lents confirmés : 2' "$T/out" || fail "2 blocs lents confirmés attendus"
         grep -q 'zone LBA 21120–21247' "$T/out" || fail "zone lente du bloc 10 mal localisée"
-        [ "$(grep -c '    zone LBA' "$T/out")" -eq 17 ] || fail "17 zones attendues (1 + bloc 30 entier)"
+        nz=$(grep -c '    zone LBA' "$T/out" || true)
+        [ "$nz" -eq 17 ] || { grep '    zone LBA' "$T/out" >&2; fail "17 zones attendues (1 + bloc 30 entier), $nz trouvée(s)"; }
         before=$(md5sum <"$D")
         run "OUI" 0 "$D" --slow-repair --log "$T/d.csv"
         [ "$before" = "$(md5sum <"$D")" ] || fail "slow-repair a modifié les données"
@@ -107,6 +122,7 @@ if command -v dmsetup >/dev/null 2>&1; then
     DM="diskmedic-flakey-$$"
     if printf '0 10248 linear %s 0\n10248 8 flakey %s 10248 0 3600 1 error_reads\n10256 %s linear %s 10256\n' \
         "$LOOP" "$LOOP" $((S - 10256)) "$LOOP" | dmsetup create "$DM" 2>/dev/null; then
+        set_rotational "/dev/mapper/$DM" 1
         # Les lectures restent en erreur après écriture : la vérification échoue (exit 1), c'est attendu.
         run "OUI" 1 "/dev/mapper/$DM" --slow-repair
         grep -q 'illisibles : 1 (secteurs illisibles : 8)' "$T/out" || fail "8 secteurs illisibles attendus"
