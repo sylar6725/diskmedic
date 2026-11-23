@@ -1975,6 +1975,13 @@ static int timed_pread(disk_io_t *io, void *buf, size_t n, uint64_t off, double 
  * dépasse sinon le seuil. Un secteur faible coûte des dizaines de ms : il reste détecté.
  */
 #define ZONE_MIN_EXCESS_MS 1.0
+/*
+ * Même principe pour les blocs de 1 Mio : un bloc n'est lent que s'il dépasse la médiane
+ * d'au moins 5 ms. Sur un NVMe ou un fichier en cache (médiane < 1 ms), les pauses de quelques
+ * ms du système dépassent sinon médiane × facteur, parfois aux deux passages. Une relecture
+ * de disque dur coûte au moins un tour de plateau (8 à 11 ms) : elle reste détectée.
+ */
+#define BLOCK_MIN_EXCESS_MS 5.0
 
 /* Zone lente localisée à l'intérieur d'un bloc de 1 Mio. */
 typedef struct {
@@ -2118,8 +2125,13 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
     if (!nsample) { fprintf(stderr, "Aucune lecture valide.\n"); goto out; }
     double median = median_of(sample, nsample);
     double threshold = median * factor;
+    int floor_used = threshold < median + BLOCK_MIN_EXCESS_MS;
+    if (floor_used) threshold = median + BLOCK_MIN_EXCESS_MS;
     free(sample); sample = NULL;
-    printf("Référence médiane : %.3f ms/bloc; seuil : %.3f ms (facteur %.2f).\n", median, threshold, factor);
+    if (floor_used)
+        printf("Référence médiane : %.3f ms/bloc; seuil : %.3f ms (support rapide : écart minimal de %.0f ms).\n",
+               median, threshold, BLOCK_MIN_EXCESS_MS);
+    else printf("Référence médiane : %.3f ms/bloc; seuil : %.3f ms (facteur %.2f).\n", median, threshold, factor);
 
     /* Passage 2 : confirmation. */
     fprintf(stderr, "Passage 2/2 : confirmation des blocs lents…\n");
