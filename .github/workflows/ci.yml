@@ -13,7 +13,7 @@ jobs:
       - name: Install test tools (QEMU, busybox, kernel modules)
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 busybox-static cpio
+          sudo apt-get install -y qemu-system-x86 busybox-static cpio sdparm
           sudo apt-get install -y "linux-modules-extra-$(uname -r)" || echo "extra kernel modules unavailable: the tests that need them will be skipped"
       - name: Compile
         run: cc -O2 -Wall -Wextra -Werror -std=c99 diskmedic.c -o diskmedic

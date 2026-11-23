@@ -28,7 +28,11 @@ unload() {
 cleanup() { unload || true; rm -rf "$T"; }
 trap cleanup EXIT HUP INT TERM
 
-fail() { echo "FAILED [$FMT]: $*" >&2; cat "$T/err" >&2 2>/dev/null || true; exit 1; }
+fail() {
+    echo "FAILED [$FMT]: $*" >&2; cat "$T/err" >&2 2>/dev/null || true
+    echo "--- standard output (last 40 lines):" >&2; tail -40 "$T/out" >&2 2>/dev/null || true
+    exit 1
+}
 run() { # run <stdin> <expected exit> <args…>
     input=$1; wanted=$2; shift 2
     set +e; printf '%s\n' "$input" | "$BIN" "$@" >"$T/out" 2>"$T/err"; got=$?; set -e
@@ -179,7 +183,7 @@ unload
 # SAFETY: only the scsi_debug disks may be selected. The test does not rely on the position
 # of the disks in the list (the menu order is not alphabetical: sdX before nvmeXnY): it reads
 # the line under the cursor and only selects lines that show "scsi_debug".
-# Before Enter, the screen must show exactly 2 selected disks; before YES, every target disk
+# Before Enter, the screen must show exactly $NSEL selected disks; before YES, every target disk
 # must be a scsi_debug disk. Otherwise the menu is left without starting anything, and the test fails.
 # Each key is only sent once the expected screen is shown (start-up can be slow), and the
 # pseudo-terminal is bounded in time: a hang makes the test fail instead of freezing it.
@@ -207,8 +211,8 @@ select_disks() { # selects only the scsi_debug disks, confirms, then waits for t
         press '\033[B'; k=$((k + 1))
     done
     case $(grep -a 'Selected: ' "$T/ts" | tail -1) in
-        *'Selected: 2 /'*) ;;
-        *) abort_tui "the menu does not show exactly 2 selected disks"; return 1 ;;
+        *"Selected: ${NSEL:-2} /"*) ;;
+        *) abort_tui "the menu does not show exactly ${NSEL:-2} selected disk(s)"; return 1 ;;
     esac
     printf '\r'; wait_screen "CHOOSE THE OPERATION" 60
 }
@@ -262,6 +266,43 @@ if command -v script >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
     [ "$(grep -c '^  \[OK\] .*· TRIM' "$T/ts")" -eq 2 ] || fail "2 TRIM OK expected in the summary"
     for d in $DEVS; do [ "$(tr -d '\000' <"$d" | wc -c)" -eq 0 ] || fail "$d not emptied by the TRIM"; done
     unload
+
+    # Single-disk menu (--tui /dev/sdX): a read verification writes its CSV log in diskmedic-*/.
+    FMT="single-disk menu"; echo "== $FMT (verification from the menu, CSV log)"
+    load 512 0
+    rm -rf "$T/par"; mkdir "$T/par"; : >"$T/ts"
+    keys_single() {
+        wait_screen '· MENU' 60; printf '2'
+        wait_screen 'Operation finished' 400; printf 'x'; sleep 0.5; printf 'q'; sleep 1
+    }
+    keys_single | (cd "$T/par" && timeout -k 5 300 script -qfec "stty rows 30 cols 90; $BIN --tui $DEV" /dev/null) >"$T/ts" 2>&1 || true
+    cp "$T/ts" "$T/err"
+    grep -aq 'Operation finished (code 0)' "$T/ts" || fail "verification from the single-disk menu did not succeed"
+    CSV=$(ls "$T"/par/diskmedic-*/"${DEV#/dev/}.csv" 2>/dev/null | head -1)
+    [ -n "$CSV" ] || fail "no CSV log created by the single-disk menu"
+    head -1 "$CSV" | grep -q '^timestamp_iso8601,device,operation,LBA,status,action$' || fail "CSV log header missing"
+    unload
+
+    # SMART verdict: a disk that predicts a failure (Informational Exceptions test mode, enabled
+    # with sdparm) must give exit code 4 and show as CRITICAL in the multi-disk summary, not OK.
+    if command -v sdparm >/dev/null 2>&1; then
+        FMT="SMART critical"; echo "== $FMT (predicted failure: exit code 4, CRITICAL in the summary)"
+        # scsi_debug disks share one mode page: a single disk, healthy first, then failing.
+        load 512 0
+        run "" 0 "$DEV" --smart
+        grep -q 'VERDICT: HEALTHY' "$T/out" || fail "HEALTHY verdict missing"
+        sdparm -q --set MRIE=6 --set TEST=1 "$DEV" || fail "sdparm could not enable the failure prediction test mode"
+        run "" 4 "$DEV" --smart
+        grep -q 'VERDICT: CRITICAL' "$T/out" || fail "CRITICAL verdict missing"
+        keys_smart() { select_disks || return 0; printf '1'; wait_screen 'press any key' 400; printf 'x'; sleep 1; }
+        rm -rf "$T/par"; mkdir "$T/par"
+        NSEL=1; tui_run keys_smart; NSEL=2
+        grep -q "^  \[CRITICAL\] *$DEV " "$T/ts" || fail "$DEV not shown as CRITICAL in the summary"
+        grep -q 'SMART alerts: 1' "$T/ts" || fail "SMART alert not counted on the dashboard"
+        unload
+    else
+        echo "SKIP: SMART critical test (sdparm missing)"
+    fi
 else
     echo "SKIP: parallel multi-disk test (script or timeout command missing)"
 fi

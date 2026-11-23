@@ -75,8 +75,8 @@ Téléchargez l'archive et `SHA256SUMS` depuis la page [Releases](../../releases
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing   # facultatif : contrôle d'intégrité
-tar -xzf diskmedic-1.11.0-linux-x86_64.tar.gz
-cd diskmedic-1.11.0-linux-x86_64
+tar -xzf diskmedic-1.12.0-linux-x86_64.tar.gz
+cd diskmedic-1.12.0-linux-x86_64
 sudo ./diskmedic --help
 ```
 
@@ -143,8 +143,14 @@ Une seule opération est acceptée par invocation.
 | `0` | Succès |
 | `1` | Erreur, opération refusée (SSD, Secure Erase impossible, TRIM non géré), secteurs illisibles trouvés, ou au moins un disque en échec (mode multi-disques) |
 | `2` | Options invalides, confirmation `YES` absente, ou mode TUI demandé sans terminal |
+| `3` / `4` / `5` | `--smart` seulement : le rapport a été lu, et son verdict est WARNING / CRITICAL / UNKNOWN (`0` = HEALTHY) |
 
 **Journal CSV** : il contient les colonnes `timestamp_iso8601,device,operation,LBA,status,action`. Les LBA sont exprimés en secteurs logiques.
+
+- Chaque LBA illisible est notée sur sa propre ligne dès qu'elle est trouvée, au passage 1 ou au passage 2 d'un scan.
+- Un bloc en erreur au passage 1 mais lisible au passage 2 reçoit une ligne `TRANSIENT READ ERROR` ; le scan se termine alors avec le code `1`.
+- Après `--slow-repair`, chaque LBA perdue reçoit une deuxième ligne avec son résultat final (`REWRITE VERIFIED…` ou `FAILED…`).
+- Une zone lente est notée avec sa plage de LBA (`SLOW: zone LBA 21120-21247 (64 KiB) …`).
 
 ## Interface interactive (TUI)
 
@@ -189,7 +195,7 @@ Si la fenêtre est petite, l'affichage passe à deux lignes par disque.
 
 - **Interruption** : `q` ou Ctrl+C, puis `y` pour confirmer. Le résumé indique l'étape et le pourcentage atteints par chaque disque. Un Secure Erase ne peut pas être interrompu, car c'est le firmware du disque qui l'exécute.
 - **Journaux** : un dossier `diskmedic-AAAAMMJJ-HHMMSS/` est créé dans le dossier courant (ou dans `/tmp`). Il contient un `sdX.log` par disque, plus un `sdX.csv` pour la vérification et le scan. Sous `sudo`, les fichiers sont attribués à l'utilisateur appelant.
-- **Fin** : le terminal normal affiche le rapport de chaque disque, puis un résumé `[OK]` / `[FAILED]` / `[INTERRUPTED]`.
+- **Fin** : le terminal normal affiche le rapport de chaque disque, puis un résumé `[OK]` / `[FAILED]` / `[INTERRUPTED]`. Pour SMART, un disque dont le verdict n'est pas sain apparaît en `[WARNING]`, `[CRITICAL]` ou `[UNKNOWN]`, et le tableau de bord le compte comme alerte SMART.
 - **Sécurité** : avant une opération destructive, la liste des disques visés s'affiche, avec l'opération prévue pour chacun. Si un seul d'entre eux est monté ou utilisé, rien n'est lancé.
 - **SSD dans la sélection** : pour une écriture zéro, DiskMedic liste les SSD et propose `t` (TRIM sur les SSD, zéros sur les disques durs), `z` (zéros partout) ou l'annulation. Pour une réparation lente, il propose `s` (scan seul sur les SSD), `r` (réparer partout) ou l'annulation.
 
@@ -199,7 +205,7 @@ Avec `--tui /dev/sdX`, le menu porte sur un seul disque. Son en-tête affiche la
 - NVMe : santé, température, vie restante ;
 - SAS : avis du firmware, température.
 
-Il indique aussi la capacité, le format de secteur et le type de support (SSD ou disque dur). Sur un SSD, les choix 4 et 5 proposent l'alternative adaptée (scan seul, TRIM) ou l'opération quand même.
+Il indique aussi la capacité, le format de secteur et le type de support (SSD ou disque dur). Sur un SSD, les choix 4 et 5 proposent l'alternative adaptée (scan seul, TRIM) ou l'opération quand même. La vérification, le scan lent et la réparation écrivent leur journal CSV dans un nouveau dossier `diskmedic-AAAAMMJJ-HHMMSS/`, comme en mode multi-disques.
 
 ## Détails techniques
 
@@ -229,7 +235,7 @@ Il indique aussi la capacité, le format de secteur et le type de support (SSD o
 ### Algorithme du scan de blocs lents
 
 1. **Passage 1, mesure** : chaque bloc de 1 Mio est chronométré. La médiane est calculée sur un échantillon de 1 million de mesures au plus, et le seuil vaut médiane × `--slow-factor`, avec un écart minimal de 5 ms au-dessus de la médiane. Sans ce plancher, sur un support très rapide (NVMe, médiane inférieure à 1 ms), les pauses ordinaires du système suffiraient à dépasser le seuil. Une relecture sur disque dur coûte au moins un tour de plateau (8 à 11 ms) et reste détectée.
-2. **Passage 2, confirmation** : un bloc n'est retenu que s'il dépasse le seuil aux deux passages. Un bloc lent à un seul passage est classé *intermittent* et n'est jamais réécrit.
+2. **Passage 2, confirmation** : un bloc n'est retenu que s'il dépasse le seuil aux deux passages. Un bloc lent à un seul passage est classé *intermittent* et n'est jamais réécrit. Une erreur de lecture est localisée secteur par secteur dès qu'elle survient, au passage 1 ou 2 ; un bloc en erreur au passage 1 et lisible au passage 2 est signalé comme *erreur de lecture passagère*.
 3. **Localisation** : chaque bloc confirmé est relu par zones de 64 Kio, ou de la taille du secteur physique si elle est plus grande, de la dernière zone à la première. Avant cela, 64 Mio sont lus ailleurs sur le disque pour vider son cache. Chaque zone est comparée à une zone saine de référence : elle est lente si elle porte au moins la moitié du retard du bloc, ou si elle dépasse le facteur × la référence avec au moins 1 ms d'écart.
 4. **Réécriture ciblée** (`--slow-repair`) : seules les zones lentes sont réécrites, avec leurs propres données, puis relues et comparées. Dans un bloc illisible, seuls les secteurs physiques qui contiennent un secteur perdu sont réécrits ; la partie perdue est remplacée par des zéros, ce qui permet au firmware de réallouer le secteur.
 5. **Contrôle différé** : chaque zone réécrite est rechronométrée après un nouveau vidage du cache, puis classée `FAST` ou `STILL SLOW`.
@@ -270,8 +276,8 @@ Les tests n'utilisent **jamais de disque réel**, seulement des fichiers, des lo
 | Commande | Droits | Contenu |
 |---|---|---|
 | `make test` | utilisateur | Options, codes de sortie, rendu SMART sur données fabriquées (HDD/SSD SATA, NVMe, SAS), décodage SAT, absence de couleurs hors terminal, largeur ≤ 80 colonnes |
-| `sudo sh tests/run_loop_tests.sh` | root | Vérification, scan, réparation, écriture zéro et refus d'un disque monté, sur loop device. Secteurs illisibles simulés par `dm-error` et `dm-flakey`, secteurs lents par `dm-delay` |
-| `sudo sh tests/run_sector_tests.sh` | root | Mêmes opérations en 512n, 512e et 4Kn avec `scsi_debug`, qui se présente comme un SSD : refus de `--zero` et `--slow-repair` sans `--force`, TRIM refusé sans UNMAP puis réussi avec. Vérifie aussi le LBA exact signalé, qu'un seul secteur physique est réécrit, le nombre de lectures en échec, et le menu multi-disques piloté au clavier dans un pseudo-terminal (dont le choix TRIM sur SSD) |
+| `sudo sh tests/run_loop_tests.sh` | root | Vérification, scan, réparation, écriture zéro et refus d'un disque monté, sur loop device. Secteurs illisibles simulés par `dm-error` et `dm-flakey`, secteurs lents par `dm-delay`, et une erreur de lecture passagère (la table en erreur est remplacée par une table saine entre les deux passages). Vérifie le journal CSV ligne par ligne |
+| `sudo sh tests/run_sector_tests.sh` | root | Mêmes opérations en 512n, 512e et 4Kn avec `scsi_debug`, qui se présente comme un SSD : refus de `--zero` et `--slow-repair` sans `--force`, TRIM refusé sans UNMAP puis réussi avec. Vérifie aussi le LBA exact signalé, qu'un seul secteur physique est réécrit, le nombre de lectures en échec, le menu multi-disques piloté au clavier dans un pseudo-terminal (dont le choix TRIM sur SSD), le journal CSV du menu d'un seul disque, et un disque qui annonce une défaillance (mode test activé avec `sdparm`) : code de sortie `4` et `[CRITICAL]` dans le résumé |
 | `sudo sh tests/run_nvme_tests.sh` | root | **nvme-loop** (cible NVMe du noyau, sans Format ni Sanitize) : SMART, refus de `--zero`, refus de Secure Erase avant confirmation, TRIM. **QEMU** (machine virtuelle de quelques secondes, avec trois contrôleurs NVMe émulés) : Format NVM réellement exécuté sur des secteurs de 512 o et de 4 Kio (format conservé), et sur un contrôleur à deux namespaces (l'autre namespace reste intact) |
 
 `make test-loop` lance les trois scripts root. Ceux-ci s'ignorent eux-mêmes (`SKIP`) si les droits, les modules du noyau ou les outils manquent.
@@ -285,6 +291,7 @@ Le choix de la méthode NVMe (Sanitize cryptographique ou par blocs, Format, cas
 - `e2fsprogs` : `mkfs.ext4` ;
 - `coreutils` : `dd`, `md5sum`, `timeout` ;
 - `udevadm` ;
+- `sdparm` (facultatif : test SMART CRITICAL) ;
 - les modules noyau `dm-delay`, `dm-flakey` et `scsi_debug`.
 
 Sur Ubuntu, `scsi_debug` est fourni par `linux-modules-extra-$(uname -r)`.
