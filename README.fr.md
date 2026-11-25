@@ -10,7 +10,7 @@ Utilitaire Linux en C pour **diagnostiquer et entretenir des disques** SATA, SAS
 - Licence MIT : libre d'utiliser, de copier, de modifier et de partager.
 
 > [!NOTE]
-> DiskMedic a été en grande partie « vibe codé » avec un assistant IA. Il est couvert par des tests automatisés sur disques virtuels, mais il a été peu testé sur du matériel réel : prudence avec des disques qui contiennent des données importantes.
+> DiskMedic a été en grande partie « vibe codé » avec un assistant IA. Il est couvert par des tests automatisés, mais il n'a pas été testé sur tous les types de disques : prudence avec des disques qui contiennent des données importantes.
 
 > [!WARNING]
 > `--zero`, `--slow-repair`, `--trim` et `--secure-erase` **détruisent des données**. Chacune demande de taper exactement `YES`, et un disque monté ou utilisé est refusé. Vérifiez quand même le périphérique visé (`lsblk -o NAME,MODEL,SERIAL,SIZE`) : aucune récupération n'est possible.
@@ -309,12 +309,12 @@ La **CI GitHub Actions** (`ubuntu-latest`) compile avec les avertissements trait
 ## Limites connues
 
 - **Secure Erase** : ATA Security Erase et, pour NVMe, Sanitize et Format NVM. ATA Sanitize (SATA) et FORMAT UNIT / SANITIZE (SAS) ne sont pas implémentés : l'option est refusée sur les disques SAS, sans rien modifier.
-- **Sanitize NVMe non testé sur matériel** : ni nvme-loop ni QEMU 8.2 n'émulent Sanitize. Son choix est testé sur données fabriquées, mais son exécution suit la spécification NVMe sans avoir été vérifiée sur un vrai disque. Format NVM, lui, est testé dans QEMU.
+- **Sanitize NVMe** : ni nvme-loop ni QEMU 8.2 n'émulent Sanitize, les tests automatisés ne couvrent donc que le choix de la méthode, sur données fabriquées. La commande elle-même suit la spécification NVMe. Format NVM est testé dans QEMU.
 - **Détection SSD** : elle repose sur ce que le firmware annonce. Un disque qui ne renseigne pas sa vitesse de rotation, derrière une passerelle USB par exemple, est jugé d'après le noyau, qui peut se tromper. Les rares disques durs NVMe seraient traités comme des SSD.
 - **`--zero`** écrit jusqu'à la taille vue par le noyau. Les zones cachées (HPA/DCO) et les blocs réservés du firmware ne sont pas atteints ; le Secure Erase, lui, les couvre en principe.
 - **Secteurs réalloués** : ils ne peuvent pas être « réparés ». Une réécriture peut seulement provoquer la réallocation d'un secteur *en attente*.
 - **Passerelles USB** : certains boîtiers ne transmettent ni les commandes ATA ni les pages SMART. Le rapport indique alors `UNKNOWN` plutôt que `HEALTHY`.
-- **Matériel testé** : SMART SAS et NVMe ont été validés sur données fabriquées, sur `scsi_debug`, sur nvme-loop et sur les contrôleurs NVMe émulés par QEMU, pas encore sur une large gamme de disques réels. Les retours accompagnés de la sortie de `smartctl -x` sont les bienvenus.
+- **Types de disques** : DiskMedic n'a pas été testé sur tous les types de disques (modèles, interfaces, passerelles USB, contrôleurs). Les retours accompagnés de la sortie de `smartctl -x` sont les bienvenus.
 - **Plate-forme** : Linux uniquement (ioctl `SG_IO`, `BLK*`, NVMe).
 
 ## Licence
