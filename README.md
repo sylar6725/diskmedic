@@ -172,18 +172,26 @@ The selected disks are **processed in parallel**, one process per disk, and foll
 
 ```
 ╔════════════════════════════════════════════════════════════════════════════════════════╗
-║DiskMedic 1.11.0 · Slow scan · 3 disk(s) in parallel                            00:00:03║
+║DiskMedic 1.14.0 · Slow scan · 3 disk(s) in parallel                            00:00:26║
 ╠════════════════════════════════════════════════════════════════════════════════════════╣
-║/dev/sde · scsi_debug · 201.3 MB                                      RUNNING · 00:00:03║
-║  Step: Pass 1/2: timing                                                   unreadable: 1║
-║  ██████████████████████████████████████████████ 100.0 % · 158.4 MiB/s · left 00:00:00  ║
-║  › Unreadable sector: LBA 20483 (No data available)                                    ║
+║> /dev/sde · scsi_debug · 209.7 MB                                    RUNNING · 00:00:26║
+║  Step: Pass 1/2: timing                                                  unreadable: 10║
+║  ███████████████████████████████░░░░░░░░░░░░░░░░░░ 64.0 % · 68.9 MiB/s · left 00:00:14 ║
+║  › Unreadable sector: LBA 4669 (No data available)                                     ║
 ╠════════════════════════════════════════════════════════════════════════════════════════╣
-║  … one block per disk …                                                                ║
+║  /dev/sdf · scsi_debug · 209.7 MB                                    RUNNING · 00:00:26║
+║  Step: Pass 1/2: timing                                                  unreadable: 10║
+║  ███████████████████████████████░░░░░░░░░░░░░░░░░░ 64.0 % · 69.0 MiB/s · left 00:00:14 ║
+║  › Unreadable sector: LBA 4669 (No data available)                                     ║
 ╠════════════════════════════════════════════════════════════════════════════════════════╣
-║Running: 3 · Finished: 0 (OK: 0, failed: 0)                                             ║
-║Logs: /root/diskmedic-20261121-232657                                                   ║
-║q = interrupt all operations                                                            ║
+║  /dev/sdg · scsi_debug · 209.7 MB                                    RUNNING · 00:00:26║
+║  Step: Pass 1/2: timing                                                  unreadable: 10║
+║  ███████████████████████████████░░░░░░░░░░░░░░░░░░ 64.0 % · 68.9 MiB/s · left 00:00:14 ║
+║  › Unreadable sector: LBA 4669 (No data available)                                     ║
+╠════════════════════════════════════════════════════════════════════════════════════════╣
+║Running: 3 · Finished: 0 (OK: 0, failed: 0)                       all done in ≈ 00:00:14║
+║Logs: /root/diskmedic-20261127-031832                                                   ║
+║↑/↓ choose a disk · Enter view its log · q interrupt all operations                     ║
 ╚════════════════════════════════════════════════════════════════════════════════════════╝
 ```
 
