@@ -6,7 +6,7 @@ trap 'rm -rf "$TMPDIR_TEST"' EXIT HUP INT TERM
 BIN="$TMPDIR_TEST/diskmedic"
 cc -O2 -Wall -Wextra -Werror -std=c99 "$ROOT/diskmedic.c" -o "$BIN"
 "$BIN" --version >"$TMPDIR_TEST/version.txt"
-grep -q 'DiskMedic 1.12.0' "$TMPDIR_TEST/version.txt"
+grep -q 'DiskMedic 1.13.0' "$TMPDIR_TEST/version.txt"
 "$BIN" --help >"$TMPDIR_TEST/help.txt"
 grep -q -- '--smart' "$TMPDIR_TEST/help.txt"
 grep -q -- '--secure-erase' "$TMPDIR_TEST/help.txt"

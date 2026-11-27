@@ -30,7 +30,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 
-#define DISKMEDIC_VERSION "1.12.0"
+#define DISKMEDIC_VERSION "1.13.0"
 #define BUF_SIZE (1024U * 1024U)
 #define ATA_TIMEOUT_MS (24U * 60U * 60U * 1000U)
 #define ATA_IDENTIFY 0xEC
@@ -44,7 +44,7 @@
 #define ATA_DISABLE_PASSWORD 0xF6
 
 typedef struct {
-    int smart_only, secure_erase, zero, verify, slow_scan, slow_repair, tui, trim, force;
+    int smart_only, secure_erase, zero, verify, slow_scan, slow_repair, tui, trim, force, no_color;
     double slow_factor;
     const char *device;
     const char *log_path;
@@ -71,7 +71,8 @@ typedef struct { uint64_t index; double ms, ms1; int status; } slow_block_t;
 static const char *ui_device = "(unknown)";
 static int ui_fd = -1;
 static uint64_t ui_size = 0;
-static int ui_tui = 0, ui_active = 0;
+static int ui_tui = 0;
+static volatile sig_atomic_t ui_active = 0;   /* alternate screen shown, cursor hidden */
 typedef struct {
     struct timespec start, last;
     uint64_t last_bytes;
@@ -80,6 +81,155 @@ typedef struct {
 /* TUI drawing output: stderr, or a memory buffer used to compose a whole screen image. */
 static FILE *ui_out = NULL;
 #define UI_OUT (ui_out ? ui_out : stderr)
+
+/* ---------- Terminal: restore on exit or fatal signal, key reading, colors, glyphs ---------- */
+static struct termios term_saved;
+static volatile sig_atomic_t term_saved_ok = 0;
+static volatile sig_atomic_t ui_resized = 0;
+static int opt_no_color = 0;
+
+/* Async-signal-safe: leaves the alternate screen and gives back the saved terminal mode. */
+static void term_leave_screen(void) {
+    if (ui_active) {
+        static const char s[] = "\033[0m\033[?25h\033[?1049l\n";
+        ssize_t r = write(STDERR_FILENO, s, sizeof(s) - 1);
+        (void)r;
+        ui_active = 0;
+    }
+}
+static void term_restore(void) {
+    term_leave_screen();
+    if (term_saved_ok) tcsetattr(STDIN_FILENO, TCSANOW, &term_saved);
+}
+static void term_on_fatal(int sig) {
+    term_restore();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+static void term_on_winch(int sig) { (void)sig; ui_resized = 1; }
+/* Remembers the terminal mode to restore, and installs the handlers (once). */
+static void term_remember(const struct termios *saved) {
+    static int installed = 0;
+    term_saved = *saved;
+    term_saved_ok = 1;
+    if (installed) return;
+    installed = 1;
+    atexit(term_restore);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = term_on_fatal;
+    const int fatal[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT };
+    for (size_t i = 0; i < sizeof(fatal) / sizeof(fatal[0]); i++) {
+        struct sigaction old;
+        if (sigaction(fatal[i], NULL, &old) == 0 && old.sa_handler == SIG_DFL) sigaction(fatal[i], &sa, NULL);
+    }
+    sa.sa_handler = term_on_winch;          /* no SA_RESTART: a blocked read_key() wakes up */
+    sigaction(SIGWINCH, &sa, NULL);
+}
+/* In a child process: no terminal to restore, default signal behaviour. */
+static void term_forget(void) {
+    term_saved_ok = 0;
+    ui_active = 0;
+    signal(SIGINT, SIG_DFL); signal(SIGTERM, SIG_DFL); signal(SIGHUP, SIG_DFL);
+    signal(SIGQUIT, SIG_DFL); signal(SIGWINCH, SIG_DFL);
+}
+
+enum { KEY_UP = 0x100, KEY_DOWN, KEY_PGUP, KEY_PGDN, KEY_HOME, KEY_END, KEY_ESC, KEY_RESIZE };
+/* One byte from stdin, or -1 after timeout_ms (-1 = wait forever), -2 at end of input. */
+static int read_byte(int timeout_ms) {
+    for (;;) {
+        if (timeout_ms < 0 && ui_resized) return -1;
+        struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
+        int r = poll(&p, 1, timeout_ms);
+        if (r < 0) { if (errno == EINTR) { if (timeout_ms < 0 && ui_resized) return -1; continue; } return -2; }
+        if (r == 0) return -1;
+        unsigned char c;
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -2;
+        return c;
+    }
+}
+/*
+ * Next key: a byte, or KEY_* for arrows, Page Up/Down, Home/End, a lone Escape and a
+ * window resize; EOF at end of input. A lone Escape no longer waits for a following key.
+ */
+static int read_key(void) {
+    for (;;) {
+        if (ui_resized) { ui_resized = 0; return KEY_RESIZE; }
+        int c = read_byte(-1);
+        if (c == -2) return EOF;
+        if (c == -1) continue;
+        if (c != 0x1b) return c;
+        int c2 = read_byte(100);
+        if (c2 == -2) return EOF;
+        if (c2 != '[' && c2 != 'O') return KEY_ESC;
+        int c3 = read_byte(100);
+        if (c3 < 0) return KEY_ESC;
+        switch (c3) {
+        case 'A': return KEY_UP;
+        case 'B': return KEY_DOWN;
+        case 'H': return KEY_HOME;
+        case 'F': return KEY_END;
+        default: break;
+        }
+        if (c3 >= '0' && c3 <= '9') {
+            int num = c3 - '0', t;
+            while ((t = read_byte(100)) >= '0' && t <= '9') num = num * 10 + (t - '0');
+            while (t >= 0 && t != '~' && !(t >= 0x40 && t <= 0x7e)) t = read_byte(100);
+            if (t == '~') {
+                if (num == 1 || num == 7) return KEY_HOME;
+                if (num == 4 || num == 8) return KEY_END;
+                if (num == 5) return KEY_PGUP;
+                if (num == 6) return KEY_PGDN;
+            }
+        }
+        /* Other sequences (function keys…) are ignored. */
+    }
+}
+/* "Press any key": a window resize does not count as a key. */
+static void wait_any_key(void) {
+    int c;
+    do c = read_key(); while (c == KEY_RESIZE);
+}
+
+/* TUI colors (stderr): disabled by --no-color, NO_COLOR, TERM=dumb or a non-terminal stderr. */
+#define COL_RED    "\033[1;31m"
+#define COL_YELLOW "\033[1;33m"
+#define COL_GREEN  "\033[1;32m"
+#define COL_CYAN   "\033[1;36m"
+#define COL_DIM    "\033[2m"
+#define COL_BOLD   "\033[1m"
+#define COL_REV    "\033[7m"
+#define COL_RESET  "\033[0m"
+static int ui_color_mode = -1;
+static int ui_color_on(void) {
+    if (ui_color_mode < 0) {
+        const char *t = getenv("TERM");
+        ui_color_mode = !opt_no_color && isatty(STDERR_FILENO) && !getenv("NO_COLOR") && !(t && !strcmp(t, "dumb"));
+    }
+    return ui_color_mode;
+}
+static const char *ui_col(const char *seq) { return ui_color_on() ? seq : ""; }
+
+/* Frame and bar glyphs: Unicode with a UTF-8 locale, plain ASCII otherwise. */
+typedef struct { const char *tl, *tr, *bl, *br, *ml, *mr, *h, *v, *full, *empty; } glyphs_t;
+static const glyphs_t glyphs_utf8 = { "╔", "╗", "╚", "╝", "╠", "╣", "═", "║", "█", "░" };
+static const glyphs_t glyphs_ascii = { "+", "+", "+", "+", "+", "+", "-", "|", "#", "." };
+static const glyphs_t *ui_glyphs(void) {
+    static const glyphs_t *g = NULL;
+    if (!g) {
+        const char *vars[3] = { "LC_ALL", "LC_CTYPE", "LANG" }, *loc = "";
+        for (int i = 0; i < 3; i++) { const char *v = getenv(vars[i]); if (v && *v) { loc = v; break; } }
+        int utf8 = 0;
+        for (const char *p = loc; *p && !utf8; p++)
+            utf8 = (tolower((unsigned char)p[0]) == 'u' && tolower((unsigned char)p[1]) == 't' &&
+                    tolower((unsigned char)p[2]) == 'f' && (p[3] == '8' || (p[3] == '-' && p[4] == '8')));
+        g = utf8 ? &glyphs_utf8 : &glyphs_ascii;
+    }
+    return g;
+}
 
 /*
  * Parallel execution (multi-disk selection): each disk is handled by a child process
@@ -143,6 +293,7 @@ static void usage(FILE *f) {
         "  --force             With --zero or --slow-repair: run anyway on an SSD\n"
         "  --tui               Interactive menu; without a disk: disks processed in parallel\n"
         "  TUI: ↑/↓ move, Space select, a select all, Enter start, q quit\n"
+        "  --no-color          No colors (the NO_COLOR environment variable does the same)\n"
         "  --help, -h          Shows this help\n"
         "  --version           Shows the version\n\n"
         "Destructive operations require typing exactly YES to confirm.\n"
@@ -159,6 +310,7 @@ static int parse_options(int argc, char **argv, options_t *o) {
         else if (!strcmp(argv[i], "--force")) o->force = 1;
         else if (!strcmp(argv[i], "--verify")) o->verify = 1;
         else if (!strcmp(argv[i], "--tui")) o->tui = 1;
+        else if (!strcmp(argv[i], "--no-color")) o->no_color = 1;
         else if (!strcmp(argv[i], "--log") && i + 1 < argc && argv[i+1][0] != '-') o->log_path = argv[++i];
         else if (!strncmp(argv[i], "--log=", 6) && argv[i][6]) o->log_path = argv[i] + 6;
         else if (!strcmp(argv[i], "--scan-slow") || !strcmp(argv[i], "--slow-scan")) o->slow_scan = 1;
@@ -191,6 +343,9 @@ static unsigned terminal_columns(void) {
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
         return (unsigned)ws.ws_col;
+    /* stdout redirected to a file: the screen is still on stderr. */
+    if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        return (unsigned)ws.ws_col;
     return 80U;
 }
 static size_t utf8_char_bytes(const unsigned char *s) {
@@ -212,25 +367,33 @@ static void print_padded(const char *text, unsigned width) {
     }
     while (used++ < width) fputc(' ', UI_OUT);
 }
-static void print_tui_line(const char *text) {
+/* Framed line; attr (color, reverse video…) applies inside the frame only. */
+static void print_tui_line_attr(const char *text, const char *attr) {
     unsigned cols = terminal_columns();
+    const glyphs_t *g = ui_glyphs();
+    int on = attr && *attr;
     if (cols >= 2) {
-        fputs("║", UI_OUT);
+        fputs(g->v, UI_OUT);
+        if (on) fputs(attr, UI_OUT);
         print_padded(text, cols - 2);
-        fputs("║\n", UI_OUT);
+        if (on) fputs(COL_RESET, UI_OUT);
+        fprintf(UI_OUT, "%s\n", g->v);
     } else {
         print_padded(text, cols);
         fputc('\n', UI_OUT);
     }
 }
+static void print_tui_line(const char *text) { print_tui_line_attr(text, NULL); }
 static void print_tui_rule(char left, char right) {
     unsigned cols = terminal_columns();
+    const glyphs_t *g = ui_glyphs();
     if (cols >= 2) {
-        fprintf(UI_OUT, "%s", left == 'T' ? "╔" : left == 'B' ? "╚" : "╠");
-        for (unsigned i = 2; i < cols; i++) fputs("═", UI_OUT);
-        fprintf(UI_OUT, "%s\n", right == 'T' ? "╗" : right == 'B' ? "╝" : "╣");
+        fputs(left == 'T' ? g->tl : left == 'B' ? g->bl : g->ml, UI_OUT);
+        for (unsigned i = 2; i < cols; i++) fputs(g->h, UI_OUT);
+        fprintf(UI_OUT, "%s\n", right == 'T' ? g->tr : right == 'B' ? g->br : g->mr);
     }
 }
+static void dash_bar_line(int has_prog, int running, double pct, unsigned tick, const char *tail, const char *color);
 /* Start of a step: in parallel mode, the step is published to the dashboard immediately. */
 static void progress_begin(progress_t *p, const char *phase, uint64_t total) {
     if (worker_slot) worker_publish(phase, 0, total, 0, 0, 0);
@@ -265,7 +428,6 @@ static void progress_show(progress_t *p, const char *phase, uint64_t done, uint6
     }
     if (ui_tui) {
         fputs("\033[H", stderr);
-        unsigned cols=terminal_columns();
         print_tui_rule('T','T');
         print_tui_line("DiskMedic · MONITOR");
         print_tui_rule('M','M');
@@ -273,20 +435,8 @@ static void progress_show(progress_t *p, const char *phase, uint64_t done, uint6
         snprintf(row,sizeof(row),"Disk: %s",ui_device); print_tui_line(row);
         snprintf(row,sizeof(row),"Step: %s",phase); print_tui_line(row);
         print_tui_rule('M','M');
-        unsigned inner=cols>2?cols-2:cols;
-        unsigned suffix=9U, bar=inner>11U?inner-11U:1U;
-        char *barline=(char *)malloc((size_t)inner+32U);
-        if(barline) {
-            unsigned pos=0;
-            if(inner>=2U) { barline[pos++]='['; }
-            unsigned room=inner>suffix+1U?inner-suffix-1U:1U;
-            if(bar>room) bar=room;
-            for(unsigned i=0;i<bar;i++) barline[pos++]=(i<(unsigned)((pct/100.0)*bar))?'#':'.';
-            int nr=snprintf(barline+pos,(size_t)inner+32U-pos,"] %6.2f%%",pct);
-            if(nr<0) barline[pos]='\0';
-            print_tui_line(barline);
-            free(barline);
-        }
+        snprintf(row,sizeof(row),"%.2f %%",pct);
+        dash_bar_line(1,1,pct,0,row,ui_col(COL_CYAN));
         snprintf(row,sizeof(row),"Current rate: %.2f MiB/s | Average: %.2f MiB/s",instant,average); print_tui_line(row);
         snprintf(row,sizeof(row),"Processed: %.2f / %.2f MiB | Time left: %s",(double)done/1048576.0,(double)total/1048576.0,etastr); print_tui_line(row);
         print_tui_rule('B','B');
@@ -319,7 +469,6 @@ static void ui_begin(void) {
         print_tui_line("DiskMedic — TERMINAL MONITOR");
         char row[PATH_MAX + 128];
         snprintf(row,sizeof(row),"Disk: %s",ui_device); print_tui_line(row);
-        print_tui_line("Interface without ncurses (ANSI sequences).");
         print_tui_rule('B','B');
         fputs("\033[J", stderr);
         fflush(stderr);
@@ -341,7 +490,7 @@ static void ui_status(const char *phase, const char *detail) {
     fflush(stderr);
 }
 static void ui_end(void) {
-    if (ui_active) { fprintf(stderr,"\033[?25h\033[?1049l\n"); fflush(stderr); ui_active=0; }
+    if (ui_active) { fflush(stderr); term_leave_screen(); }
 }
 static int confirm_mutation(void) {
     char line[64];
@@ -748,7 +897,7 @@ static int color_mode = -1;
 static int color_on(void) {
     if (color_mode < 0) {
         const char *t = getenv("TERM");
-        color_mode = isatty(STDOUT_FILENO) && !getenv("NO_COLOR") && !(t && !strcmp(t, "dumb"));
+        color_mode = !opt_no_color && isatty(STDOUT_FILENO) && !getenv("NO_COLOR") && !(t && !strcmp(t, "dumb"));
     }
     return color_mode;
 }
@@ -793,6 +942,13 @@ static void fmt_bytes(char *out, size_t n, double bytes) {
     while (bytes >= 1000.0 && k < 5) { bytes /= 1000.0; k++; }
     char num[16]; fmt_dec(num, sizeof(num), bytes, k ? 1 : 0);
     snprintf(out, n, "%s %s", num, u[k]);
+}
+/* Capacity shown everywhere in the TUI: "1.0 TB (931.5 GiB)". */
+static void fmt_capacity(char *out, size_t n, uint64_t bytes) {
+    char dec[32], gib[32];
+    fmt_bytes(dec, sizeof(dec), (double)bytes);
+    fmt_dec(gib, sizeof(gib), (double)bytes / 1073741824.0, 1);
+    snprintf(out, n, "%s (%s GiB)", dec, gib);
 }
 static void fmt_hours(char *out, size_t n, uint64_t h) {
     char hs[32]; fmt_int(hs, sizeof(hs), h);
@@ -2434,6 +2590,8 @@ typedef struct {
     char serial[DISK_INFO_LEN];
     char type[DISK_INFO_LEN];
     uint64_t bytes;
+    char kind[8];                       /* "HDD", "SSD", "NVMe" or "?" (TUI only) */
+    int in_use, system_disk;            /* mounted/held; holds the root filesystem (TUI only) */
 } disk_info_t;
 
 /* Metadata reused by the TUI; only the selected entries are kept. */
@@ -2632,6 +2790,112 @@ static size_t scan_disks(disk_info_t disks[MAX_DISKS]) {
     return count;
 }
 
+/* 1 if path has a component equal to name ("/sys/.../block/sda/sda2" contains "sda"). */
+static int path_has_component(const char *path, const char *name) {
+    size_t l = strlen(name);
+    for (const char *p = strchr(path, '/'); p; p = strchr(p + 1, '/'))
+        if (!strncmp(p + 1, name, l) && (p[1 + l] == '/' || p[1 + l] == '\0')) return 1;
+    return 0;
+}
+/* 1 if block device ma:mi is the disk, one of its partitions, or built on it (LVM, RAID, dm-crypt). */
+static int blockdev_on_disk(unsigned ma, unsigned mi, const char *name, int depth) {
+    char path[64];
+    snprintf(path, sizeof(path), "/sys/dev/block/%u:%u", ma, mi);
+    char *real = realpath(path, NULL);
+    if (!real) return 0;
+    int hit = path_has_component(real, name);
+    if (!hit && depth < 4) {
+        char slaves[PATH_MAX + 16];
+        snprintf(slaves, sizeof(slaves), "%s/slaves", real);
+        DIR *d = opendir(slaves);
+        struct dirent *e;
+        while (d && !hit && (e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            char devf[PATH_MAX + 300], v[32];
+            unsigned a, b;
+            snprintf(devf, sizeof(devf), "%s/%.255s/dev", slaves, e->d_name);
+            if (read_sysfs_value(devf, v, sizeof(v)) == 0 && sscanf(v, "%u:%u", &a, &b) == 2)
+                hit = blockdev_on_disk(a, b, name, depth + 1);
+        }
+        if (d) closedir(d);
+    }
+    free(real);
+    return hit;
+}
+/* Device holding the root filesystem (from /proc/self/mounts, or the st_dev of "/"); 0 if unknown. */
+static int root_device(unsigned *ma, unsigned *mi) {
+    char line[4096], src[PATH_MAX] = "";
+    FILE *f = fopen("/proc/self/mounts", "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            char s[PATH_MAX], m[PATH_MAX];
+            if (sscanf(line, "%4095s %4095s", s, m) == 2 && !strcmp(m, "/")) snprintf(src, sizeof(src), "%s", s);
+        }
+        fclose(f);
+    }
+    struct stat st;
+    if (!strncmp(src, "/dev/", 5) && stat(src, &st) == 0 && S_ISBLK(st.st_mode)) {
+        *ma = major(st.st_rdev); *mi = minor(st.st_rdev); return 1;
+    }
+    if (stat("/", &st) == 0 && major(st.st_dev) != 0) { *ma = major(st.st_dev); *mi = minor(st.st_dev); return 1; }
+    return 0;
+}
+/* Media type and use of each disk, for the selection screens (read-only probes). */
+static void load_disk_status(disk_info_t *disks, size_t count) {
+    unsigned rma = 0, rmi = 0;
+    int have_root = root_device(&rma, &rmi);
+    for (size_t i = 0; i < count; i++) {
+        disk_info_t *d = &disks[i];
+        char dev[PATH_MAX + 128];
+        snprintf(dev, sizeof(dev), "/dev/%.255s", d->name);
+        snprintf(d->kind, sizeof(d->kind), "?");
+        d->system_disk = have_root && blockdev_on_disk(rma, rmi, d->name, 0);
+        /* O_EXCL is refused (EBUSY) while a partition is mounted or the disk is held (swap, LVM, RAID…). */
+        int fd = open(dev, O_RDONLY | O_NONBLOCK | O_EXCL | O_CLOEXEC);
+        if (fd < 0) {
+            d->in_use = errno == EBUSY;
+            fd = open(dev, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        }
+        if (d->system_disk) d->in_use = 1;
+        if (fd < 0) continue;
+        media_t m = media_detect(fd);
+        close(fd);
+        if (!strncmp(d->name, "nvme", 4)) snprintf(d->kind, sizeof(d->kind), "NVMe");
+        else if (m.kind == MEDIA_SSD) snprintf(d->kind, sizeof(d->kind), "SSD");
+        else if (m.kind == MEDIA_HDD) snprintf(d->kind, sizeof(d->kind), "HDD");
+    }
+}
+static const char *disk_badge(const disk_info_t *d) { return d->system_disk ? "SYSTEM" : d->in_use ? "IN USE" : ""; }
+/* "model · serial X · 1.0 TB (931.5 GiB) · SSD · IN USE": the model comes first. */
+static void disk_summary(const disk_info_t *d, char *out, size_t n) {
+    char cap[80];
+    fmt_capacity(cap, sizeof(cap), d->bytes);
+    const char *badge = disk_badge(d);
+    snprintf(out, n, "%.255s · serial %.255s · %s · %s%s%s", d->model, d->serial, cap, d->kind, *badge ? " · " : "", badge);
+}
+/* Framed block of the selected disks, using at most max_lines lines. */
+static void print_selected_block(const unsigned char *selected, size_t count, size_t nsel, unsigned max_lines) {
+    uint64_t total = 0;
+    for (size_t i = 0; i < count; i++) if (selected[i]) total += tui_disks[i].bytes;
+    char cap[80], row[1400], sum[1200];
+    fmt_capacity(cap, sizeof(cap), total);
+    snprintf(row, sizeof(row), "Selected disks (%zu) · total %s", nsel, cap);
+    print_tui_line_attr(row, ui_col(COL_BOLD));
+    size_t avail = max_lines > 1 ? max_lines - 1 : 1, room = nsel <= avail ? nsel : avail - 1, shown = 0;
+    for (size_t i = 0; i < count && shown < room; i++) {
+        if (!selected[i]) continue;
+        const disk_info_t *d = &tui_disks[i];
+        disk_summary(d, sum, sizeof(sum));
+        snprintf(row, sizeof(row), "  /dev/%-8.64s %.1300s", d->name, sum);
+        print_tui_line_attr(row, d->system_disk ? ui_col(COL_RED) : d->in_use ? ui_col(COL_YELLOW) : NULL);
+        shown++;
+    }
+    if (shown < nsel) {
+        snprintf(row, sizeof(row), "  … and %zu more disk(s): enlarge the window to see them", nsel - shown);
+        print_tui_line(row);
+    }
+}
+
 static int make_log_dir(char *out, size_t n);
 static void give_to_sudo_user(const char *path);
 /* Single-disk menu: CSV log in a new diskmedic-YYYYMMDD-HHMMSS/ directory, like the multi-disk mode. */
@@ -2651,7 +2915,7 @@ static int tui_menu(int fd, uint64_t size, const char *dev) {
     struct termios saved, raw;
     int raw_enabled = isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &saved) == 0;
     if (!raw_enabled) { fprintf(stderr, "--tui mode requires an interactive terminal on stdin.\n"); return -1; }
-    if (raw_enabled) { raw = saved; raw.c_lflag &= (tcflag_t)~(ICANON | ECHO); raw.c_cc[VMIN]=1; raw.c_cc[VTIME]=0; tcsetattr(STDIN_FILENO,TCSANOW,&raw); }
+    if (raw_enabled) { term_remember(&saved); raw = saved; raw.c_lflag &= (tcflag_t)~(ICANON | ECHO); raw.c_cc[VMIN]=1; raw.c_cc[VTIME]=0; tcsetattr(STDIN_FILENO,TCSANOW,&raw); }
     ui_tui = 1; ui_device = dev; ui_size = size; ui_fd = fd; ui_begin();
     /* Header card: IDENTIFY for ATA, otherwise an NVMe or SAS/SCSI card (silent probes). */
     const int is_nvme = ioctl(fd, NVME_IOCTL_ID) > 0;
@@ -2699,22 +2963,25 @@ static int tui_menu(int fd, uint64_t size, const char *dev) {
             const char *fmt = log_sector_size == 512 && phys_sector_size == 512 ? "512n"
                             : log_sector_size == 512 && phys_sector_size == 4096 ? "512e"
                             : log_sector_size == 4096 && phys_sector_size == 4096 ? "4Kn" : "other";
-            char gib[32]; fmt_dec(gib, sizeof(gib), (double)size/1073741824.0, 2);
-            snprintf(menu_row,sizeof(menu_row),"Capacity: %s GiB · %llu sectors of 512 B · %s (%u/%u B)",
-                     gib,(unsigned long long)sectors,fmt,log_sector_size,phys_sector_size);
+            char cap[80], nsec[32];
+            fmt_capacity(cap, sizeof(cap), size);
+            fmt_int(nsec, sizeof(nsec), (uint64_t)sectors);
+            snprintf(menu_row,sizeof(menu_row),"Capacity: %s · %s sectors of 512 B · %s (%u/%u B)",
+                     cap,nsec,fmt,log_sector_size,phys_sector_size);
             print_tui_line(menu_row);
             snprintf(menu_row,sizeof(menu_row),"Media: %s",media.why); print_tui_line(menu_row);
         }
         print_tui_rule('M','M');
         print_tui_line("1 = SMART  | 2 = Read verification | 3 = Slow scan");
-        print_tui_line("Destructive: 4 = Slow-repair | 5 = Zero-fill | 6 = Secure erase | 7 = TRIM");
+        print_tui_line_attr("Destructive: 4 = Slow-repair | 5 = Zero-fill | 6 = Secure erase | 7 = TRIM", ui_col(COL_RED));
         print_tui_line("r = Refresh | q = Quit");
         print_tui_rule('B','B');
         fputs("\033[J",stderr);
         fputs("Choice: ",stderr); fflush(stderr);
-        int c=getchar(); if(c=='q'||c=='Q'||c==EOF) break;
+        int c=read_key(); if(c=='q'||c=='Q'||c==EOF) break;
+        if(c==KEY_RESIZE) continue;
         if(c=='r'||c=='R') { TUI_PROBE(); continue; }
-        if(c=='1') { smart_report(fd); fflush(stdout); fprintf(stderr,"\nPress any key…"); getchar(); continue; }
+        if(c=='1') { smart_report(fd); fflush(stdout); fprintf(stderr,"\nPress any key…"); fflush(stderr); wait_any_key(); continue; }
         int mutation=(c=='4'||c=='5'||c=='6'||c=='7');
         if(c!='2'&&c!='3'&&!mutation) continue;
         if((c=='4'||c=='5') && media.kind==MEDIA_SSD) {
@@ -2731,7 +2998,7 @@ static int tui_menu(int fd, uint64_t size, const char *dev) {
             if(c=='5' && a=='t') c='7';
             else if(c=='4' && a=='s') c='3';
             else if(!((c=='5' && a=='z') || (c=='4' && a=='r'))) {
-                fprintf(stderr,"Cancelled: nothing was modified. Press any key…"); fflush(stderr); getchar(); continue;
+                fprintf(stderr,"Cancelled: nothing was modified. Press any key…"); fflush(stderr); wait_any_key(); continue;
             }
             mutation=c!='3';
         }
@@ -2758,7 +3025,9 @@ static int tui_menu(int fd, uint64_t size, const char *dev) {
             close_log(); if(log_failed) ret=-1;
         }
         fflush(stdout);
-        fprintf(stderr,"\nOperation finished (code %d). Press any key…",ret); fflush(stderr); getchar(); ret=0;
+        fprintf(stderr,"\n%sOperation finished: %s (code %d)%s. Press any key…",
+                ui_col(ret==0?COL_GREEN:COL_RED), ret==0?"OK":"FAILED", ret, ui_col(COL_RESET));
+        fflush(stderr); wait_any_key(); ret=0;
     }
     if(raw_enabled) tcsetattr(STDIN_FILENO,TCSANOW,&saved);
     ui_end(); return ret;
@@ -2804,15 +3073,17 @@ static void print_tui_line_lr(const char *left, const char *right, const char *c
     unsigned cols = terminal_columns(), inner = cols > 2 ? cols - 2 : 1;
     unsigned rw = right && *right ? utf8_width(right) : 0;
     if (rw + 1 >= inner) rw = 0;
-    fputs("║", UI_OUT);
+    const glyphs_t *g = ui_glyphs();
+    int on = color && *color;
+    fputs(g->v, UI_OUT);
     print_padded(left, rw ? inner - rw - 1 : inner);
     if (rw) {
         fputc(' ', UI_OUT);
-        if (color) fputs(color, UI_OUT);
+        if (on) fputs(color, UI_OUT);
         print_padded(right, rw);
-        if (color) fputs("\033[0m", UI_OUT);
+        if (on) fputs(COL_RESET, UI_OUT);
     }
-    fputs("║\n", UI_OUT);
+    fprintf(UI_OUT, "%s\n", g->v);
 }
 /* Files created under sudo are handed back to the user who ran sudo, so they can delete them. */
 static void give_to_sudo_user(const char *path) {
@@ -2899,12 +3170,14 @@ static void print_log_excerpt(const char *path, unsigned max_lines) {
     free(b);
 }
 /* Progress line: bar, then text (percentage, rate…). */
-static void dash_bar_line(int has_prog, int running, double pct, unsigned tick, const char *tail) {
+static void dash_bar_line(int has_prog, int running, double pct, unsigned tick, const char *tail, const char *color) {
     unsigned cols = terminal_columns(), inner = cols > 2 ? cols - 2 : 1;
     unsigned tw = utf8_width(tail);
     int bw = (int)inner - 2 - 1 - (int)tw - 1;
     if (bw > 60) bw = 60;
-    char *row = malloc((size_t)inner * 3 + strlen(tail) + 16);
+    const glyphs_t *g = ui_glyphs();
+    size_t lf = strlen(g->full), le = strlen(g->empty);
+    char *row = malloc((size_t)inner * (lf > le ? lf : le) + strlen(tail) + 16);
     if (!row) return;
     size_t u = 0;
     row[u++] = ' '; row[u++] = ' ';
@@ -2915,23 +3188,24 @@ static void dash_bar_line(int has_prog, int running, double pct, unsigned tick, 
         if (pos > bw - 3) pos = 2 * (bw - 3) - pos;
         for (int i = 0; i < bw; i++) {
             int on = has_prog ? i < filled : (i >= pos && i < pos + 3);
-            memcpy(row + u, on ? "█" : "░", 3); u += 3;
+            if (on) { memcpy(row + u, g->full, lf); u += lf; }
+            else { memcpy(row + u, g->empty, le); u += le; }
         }
         row[u++] = ' ';
     }
     snprintf(row + u, strlen(tail) + 2, "%s", tail);
-    print_tui_line(row);
+    print_tui_line_attr(row, color);
     free(row);
 }
 static const char *job_label(const job_t *j, const char **color) {
-    if (j->status == JR_NOT_STARTED) { *color = "\033[1;31m"; return "NOT STARTED"; }
-    if (j->state == JOB_RUNNING) { *color = "\033[1;36m"; return "RUNNING"; }
-    if (j->status == JR_OK) { *color = "\033[1;32m"; return "OK"; }
-    if (j->status == JR_KILLED) { *color = "\033[1;33m"; return "INTERRUPTED"; }
-    if (j->status == JR_WARN) { *color = "\033[1;33m"; return "WARNING"; }
-    if (j->status == JR_CRIT) { *color = "\033[1;31m"; return "CRITICAL"; }
-    if (j->status == JR_UNKNOWN) { *color = "\033[1;33m"; return "UNKNOWN"; }
-    *color = "\033[1;31m"; return "FAILED";
+    if (j->status == JR_NOT_STARTED) { *color = ui_col(COL_RED); return "NOT STARTED"; }
+    if (j->state == JOB_RUNNING) { *color = ui_col(COL_CYAN); return "RUNNING"; }
+    if (j->status == JR_OK) { *color = ui_col(COL_GREEN); return "OK"; }
+    if (j->status == JR_KILLED) { *color = ui_col(COL_YELLOW); return "INTERRUPTED"; }
+    if (j->status == JR_WARN) { *color = ui_col(COL_YELLOW); return "WARNING"; }
+    if (j->status == JR_CRIT) { *color = ui_col(COL_RED); return "CRITICAL"; }
+    if (j->status == JR_UNKNOWN) { *color = ui_col(COL_YELLOW); return "UNKNOWN"; }
+    *color = ui_col(COL_RED); return "FAILED";
 }
 static void dash_draw(const job_t *jobs, size_t njobs, const worker_slot_t *slots, const char *op_name,
                       const char *logdir, const struct timespec *t0, const char *footer, unsigned tick) {
@@ -2998,9 +3272,9 @@ static void dash_draw(const job_t *jobs, size_t njobs, const worker_slot_t *slot
         }
         if (full) {
             snprintf(left, sizeof(left), "  Step: %s", w.phase[0] ? w.phase : "Starting");
-            print_tui_line_lr(left, badtxt, "\033[1;31m");
+            print_tui_line_lr(left, badtxt, ui_col(COL_RED));
         }
-        dash_bar_line(has_prog, run, pct, tick, tail);
+        dash_bar_line(has_prog, run, pct, tick, tail, color);
         if (full) {
             char last[512];
             last_log_line(j->log, last, sizeof(last));
@@ -3009,7 +3283,7 @@ static void dash_draw(const job_t *jobs, size_t njobs, const worker_slot_t *slot
             if (run && has_prog && w.updated.tv_sec && stale >= 10.0)
                 snprintf(right, sizeof(right), "updated %.0f s ago", stale);
             snprintf(left, sizeof(left), "  › %s", last);
-            print_tui_line_lr(left, right, "\033[33m");
+            print_tui_line_lr(left, right, ui_col("\033[33m"));
         }
     }
     if (shown < njobs) {
@@ -3076,17 +3350,24 @@ static int tui_multi(void) {
         fprintf(stderr, "TUI mode requires an interactive terminal on stdin.\n");
         return -1;
     }
+    term_remember(&saved);
     raw = saved;
     raw.c_lflag &= (tcflag_t)~(ICANON | ECHO);
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0) { perror("tcsetattr"); return -1; }
+    load_disk_status(tui_disks, count);
+    int any_badge = 0;
+    for (size_t i = 0; i < count; i++) any_badge |= tui_disks[i].in_use;
     ui_tui = 1;
     ui_begin();
     for (;;) {
-        char row[PATH_MAX + 256];
+        char row[PATH_MAX + 256], cap[80], attr[32];
         size_t first = cursor >= 8 ? cursor - 7 : 0;
         size_t last = first + 8 < count ? first + 8 : count;
+        unsigned cols = terminal_columns(), inner = cols > 2 ? cols - 2 : 1;
+        int mw = (int)inner - 55;
+        if (mw < 10) mw = 10;
         fputs("\033[H", stderr);
         print_tui_rule('T', 'T');
         snprintf(row, sizeof(row), "DiskMedic %s · MULTIPLE SELECTION", DISKMEDIC_VERSION);
@@ -3094,31 +3375,35 @@ static int tui_multi(void) {
         print_tui_rule('M', 'M');
         print_tui_line("↑/↓ move | Space select | a select all | Enter start | q quit");
         for (size_t i = first; i < last; i++) {
-            snprintf(row, sizeof(row), "%c [%c] /dev/%s — %s (%.2f GiB)",
-                     i == cursor ? '>' : ' ', selected[i] ? 'x' : ' ', tui_disks[i].name,
-                     tui_disks[i].model, (double)tui_disks[i].bytes / 1073741824.0);
-            if (i == cursor) fputs("\033[7m", stderr);
-            print_tui_line(row);
-            if (i == cursor) fputs("\033[0m", stderr);
+            const disk_info_t *d = &tui_disks[i];
+            fmt_capacity(cap, sizeof(cap), d->bytes);
+            snprintf(row, sizeof(row), "%c [%c] /dev/%-8s %-*.*s %-22s %-4s %s",
+                     i == cursor ? '>' : ' ', selected[i] ? 'x' : ' ', d->name,
+                     mw, mw, d->model, cap, d->kind, disk_badge(d));
+            snprintf(attr, sizeof(attr), "%s%s", i == cursor ? COL_REV : "",
+                     d->system_disk ? ui_col(COL_RED) : d->in_use ? ui_col(COL_YELLOW) : "");
+            print_tui_line_attr(row, attr);
         }
         print_tui_rule('M', 'M');
         snprintf(row, sizeof(row), "Selected: %zu / %zu", selected_count, count);
         print_tui_line(row);
+        if (any_badge)
+            print_tui_line_attr("IN USE = mounted or held (swap, LVM, RAID…): read-only operations only · "
+                                "SYSTEM = holds the root filesystem", ui_col(COL_DIM));
         print_tui_rule('B', 'B');
         fputs("\033[J", stderr);
         fflush(stderr);
-        int c = getchar();
+        int c = read_key();
         if (c == 'q' || c == 'Q' || c == EOF) {
             tcsetattr(STDIN_FILENO, TCSANOW, &saved); ui_end(); return 0;
         }
-        if (c == '\033') {
-            int c2 = getchar();
-            if (c2 == '[') {
-                int c3 = getchar();
-                if (c3 == 'A' && cursor > 0) cursor--;
-                else if (c3 == 'B' && cursor + 1 < count) cursor++;
-            }
-        } else if (c == ' ' || c == 'x' || c == 'X') {
+        if (c == KEY_UP || c == 'k') { if (cursor > 0) cursor--; }
+        else if (c == KEY_DOWN || c == 'j') { if (cursor + 1 < count) cursor++; }
+        else if (c == KEY_HOME) cursor = 0;
+        else if (c == KEY_END) cursor = count - 1;
+        else if (c == KEY_PGUP) cursor = cursor > 8 ? cursor - 8 : 0;
+        else if (c == KEY_PGDN) cursor = cursor + 8 < count ? cursor + 8 : count - 1;
+        else if (c == ' ' || c == 'x' || c == 'X') {
             selected[cursor] = (unsigned char)!selected[cursor];
             selected_count = 0;
             for (size_t i = 0; i < count; i++) selected_count += selected[i] != 0;
@@ -3138,10 +3423,14 @@ static int tui_multi(void) {
         print_tui_rule('T', 'T');
         print_tui_line("CHOOSE THE OPERATION");
         print_tui_rule('M', 'M');
+        /* The selected disks stay in view while the operation is chosen. */
+        unsigned rows = terminal_rows();
+        print_selected_block(selected, count, selected_count, rows > 12 ? rows - 11 : 1);
+        print_tui_rule('M', 'M');
         print_tui_line("1 SMART | 2 Read verification | 3 Slow scan | q back");
-        print_tui_line("Destructive: 4 Slow-block repair | 5 Zero-fill | 6 Secure Erase | 7 TRIM");
+        print_tui_line_attr("Destructive: 4 Slow-block repair | 5 Zero-fill | 6 Secure Erase | 7 TRIM", ui_col(COL_RED));
         print_tui_rule('B', 'B'); fputs("\033[J", stderr); fflush(stderr);
-        int c = getchar();
+        int c = read_key();
         if (c == 'q' || c == 'Q' || c == EOF) {
             tcsetattr(STDIN_FILENO, TCSANOW, &saved); ui_end(); return 0;
         }
@@ -3154,6 +3443,16 @@ static int tui_multi(void) {
     /* Operation per disk: on SSDs, TRIM instead of zeros, scan only instead of repair. */
     int disk_op[MAX_DISKS];
     for (size_t i = 0; i < MAX_DISKS; i++) disk_op[i] = operation;
+    /* Destructive choice: the selected disks are listed again on the normal screen. */
+    if (op_mutates(operation)) {
+        fprintf(stderr, "\nSelected disks (%zu):\n", selected_count);
+        for (size_t i = 0; i < count; i++) {
+            if (!selected[i]) continue;
+            char sum[1200];
+            disk_summary(&tui_disks[i], sum, sizeof(sum));
+            fprintf(stderr, "  /dev/%s — %s\n", tui_disks[i].name, sum);
+        }
+    }
     if (operation == 4 || operation == 5) {
         unsigned char is_ssd[MAX_DISKS] = {0};
         size_t nssd = 0;
@@ -3217,8 +3516,13 @@ static int tui_multi(void) {
         }
         if (!busy) {
             fprintf(stderr, "\n%s on %zu disk(s) at the same time:\n", op_name, selected_count);
-            for (size_t i = 0; i < count; i++)
-                if (selected[i]) fprintf(stderr, "  /dev/%s — %s → %s\n", tui_disks[i].name, tui_disks[i].model, op_label(disk_op[i]));
+            for (size_t i = 0; i < count; i++) {
+                if (!selected[i]) continue;
+                char sum[1200];
+                disk_summary(&tui_disks[i], sum, sizeof(sum));
+                fprintf(stderr, "  %s/dev/%s — %s → %s%s\n", ui_col(op_mutates(disk_op[i]) ? COL_RED : ""),
+                        tui_disks[i].name, sum, op_label(disk_op[i]), ui_col(COL_RESET));
+            }
         }
         if (busy || !confirm_mutation()) {
             if (!busy) fprintf(stderr, "Confirmation declined; no operation started.\n");
@@ -3262,7 +3566,8 @@ static int tui_multi(void) {
         if (pid == 0) {
             /* Child process: output to the disk's log, progress to the shared memory. */
             worker_slot = &slots[k];
-            ui_tui = 0; ui_active = 0; ui_out = NULL; color_mode = 0;
+            term_forget();
+            ui_tui = 0; ui_out = NULL; color_mode = 0; ui_color_mode = 0;
             int nul = open("/dev/null", O_RDONLY);
             if (nul >= 0) { dup2(nul, STDIN_FILENO); close(nul); }
             if (!freopen(j->log, "w", stdout)) _exit(1);
@@ -3413,6 +3718,7 @@ int main(int argc,char **argv) {
     if (argc==2 && !strcmp(argv[1],"--version")) { printf("DiskMedic %s\n",DISKMEDIC_VERSION); return 0; }
     if (argc==2 && (!strcmp(argv[1],"--help") || !strcmp(argv[1],"-h"))) { usage(stdout); return 0; }
     options_t o; if(parse_options(argc,argv,&o)<0) { usage(stderr); return 2; }
+    opt_no_color = o.no_color;
     if (o.tui && !isatty(STDIN_FILENO)) {
         fprintf(stderr, "TUI mode requires an interactive terminal on stdin.\n\n");
         usage(stderr); return 2;
