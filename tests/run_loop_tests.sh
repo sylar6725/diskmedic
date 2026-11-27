@@ -87,7 +87,16 @@ if command -v dmsetup >/dev/null 2>&1; then
         [ "$(grep -c DEFECTIVE "$T/bad.csv")" -eq 8 ] || fail "CSV log: 8 entries expected"
         run "" 1 "/dev/mapper/$DM" --scan-slow
         grep -q 'unreadable sectors: 8' "$T/out" || fail "scan-slow: unreadable sectors not counted"
+        echo "- zero-fill over unwritable sectors: the rest of the disk is still erased"
+        set_rotational "/dev/mapper/$DM" 1
+        run "YES" 1 "/dev/mapper/$DM" --zero --log "$T/z.csv"
+        [ "$(grep -c '"zero","[0-9]*","DEFECTIVE: write failed"' "$T/z.csv")" -eq 8 ] || fail "zero: 8 unwritable LBAs expected in the CSV log"
+        [ "$(grep -c '"zero-verify","[0-9]*","DEFECTIVE: read failed"' "$T/z.csv")" -eq 8 ] || fail "zero: 8 unreadable LBAs expected on read-back"
+        for l in 4096 4103; do grep -q "\"zero\",\"$l\",\"DEFECTIVE: write failed" "$T/z.csv" || fail "zero: LBA $l missing"; done
+        grep -q '8 unwritable, 8 unreadable and 0 non-zero' "$T/err" || fail "zero: error summary missing"
         dmsetup remove --retry "$DM"; DM=""
+        [ "$(dd if="$LOOP" bs=512 count=4096 status=none | tr -d '\000' | wc -c)" -eq 0 ] || fail "zero: start of disk not erased"
+        [ "$(dd if="$LOOP" bs=512 skip=4104 status=none | tr -d '\000' | wc -c)" -eq 0 ] || fail "zero: end of disk not erased after the bad sectors"
     else echo "  SKIP (device-mapper unavailable)"; DM=""; fi
 else echo "  SKIP (dmsetup missing)"; fi
 
@@ -96,8 +105,10 @@ if command -v dmsetup >/dev/null 2>&1; then
     attach 64M
     S=$(blockdev --getsz "$LOOP")
     DM="diskmedic-transient-$$"
-    BADL=122880   # block 60; blocks 0-59 are delayed by 10 ms so that pass 2 reaches it ~600 ms after it starts
-    if printf '0 %s delay %s 0 10\n%s 8 error\n%s %s linear %s %s\n' "$BADL" "$LOOP" "$BADL" $((BADL + 8)) \
+    # Block 60; blocks 0-59 are delayed by 50 ms. Pass 2 re-reads only this candidate, after flushing
+    # the disk's cache by reading 16 MiB from the start (16 x 50 ms): time enough to swap the table.
+    BADL=122880
+    if printf '0 %s delay %s 0 50\n%s 8 error\n%s %s linear %s %s\n' "$BADL" "$LOOP" "$BADL" $((BADL + 8)) \
         $((S - BADL - 8)) "$LOOP" $((BADL + 8)) | dmsetup create "$DM" 2>/dev/null; then
         D="/dev/mapper/$DM"
         set_rotational "$D" 1
@@ -105,7 +116,7 @@ if command -v dmsetup >/dev/null 2>&1; then
         ( set +e; "$BIN" "$D" --scan-slow --log "$T/t.csv" </dev/null >"$T/out" 2>"$T/err"; echo $? >"$T/rc" ) &
         j=0; while ! grep -q 'Pass 2/2' "$T/err" && [ "$j" -lt 1200 ]; do sleep 0.05; j=$((j + 1)); done
         # Pass 2 has started: the error disappears (healthy table loaded and swapped in).
-        printf '0 %s delay %s 0 10\n%s %s linear %s %s\n' "$BADL" "$LOOP" "$BADL" $((S - BADL)) "$LOOP" "$BADL" \
+        printf '0 %s delay %s 0 50\n%s %s linear %s %s\n' "$BADL" "$LOOP" "$BADL" $((S - BADL)) "$LOOP" "$BADL" \
             | dmsetup load "$DM" && dmsetup suspend "$DM" && dmsetup resume "$DM"
         wait
         [ "$(cat "$T/rc")" -eq 1 ] || fail "exit $(cat "$T/rc") instead of 1 for a scan with a transient read error"
@@ -130,6 +141,7 @@ if command -v dmsetup >/dev/null 2>&1; then
         set_rotational "$D" 1
         run "" 0 "$D" --scan-slow
         grep -q 'confirmed slow: 2' "$T/out" || fail "2 confirmed slow blocks expected"
+        grep -q 'Pass 2/2: confirming 2 candidate block(s)' "$T/err" || fail "pass 2 should re-read the 2 candidates only"
         grep -q 'zone LBA 21120–21247' "$T/out" || fail "slow zone of block 10 located incorrectly"
         nz=$(grep -c '    zone LBA' "$T/out" || true)
         [ "$nz" -eq 17 ] || { grep '    zone LBA' "$T/out" >&2; fail "17 zones expected (1 + whole block 30), $nz found"; }

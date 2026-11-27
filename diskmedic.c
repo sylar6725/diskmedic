@@ -30,7 +30,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 
-#define DISKMEDIC_VERSION "1.14.0"
+#define DISKMEDIC_VERSION "1.15.0"
 #define BUF_SIZE (1024U * 1024U)
 #define ATA_TIMEOUT_MS (24U * 60U * 60U * 1000U)
 #define ATA_IDENTIFY 0xEC
@@ -66,7 +66,7 @@ enum {
     SB_NOT_REPRODUCED,  /* slow on both passes but not during location */
     SB_TRANSIENT        /* read error on pass 1, readable again on pass 2 */
 };
-typedef struct { uint64_t index; double ms, ms1; int status; } slow_block_t;
+typedef struct { uint64_t index; double ms, ms1, med; int status; } slow_block_t;
 
 static const char *ui_device = "(unknown)";
 static int ui_fd = -1;
@@ -341,7 +341,7 @@ static int parse_options(int argc, char **argv, options_t *o) {
     if ((o->smart_only + o->secure_erase + o->zero + o->verify + o->slow_scan + o->trim) != 1) return -1;
     if (o->force && !(o->zero || o->slow_repair)) return -1;
     if (o->slow_repair && !o->slow_scan) return -1;
-    if (o->log_path && !(o->verify || o->slow_scan)) return -1;
+    if (o->log_path && !(o->verify || o->slow_scan || o->zero)) return -1;
     return 0;
 }
 /* Width is taken from stdout as requested; stderr carries the UI output. */
@@ -612,9 +612,46 @@ static int claim_device(const char *dev) {
     return fd;
 }
 
+static uint64_t read_sectors(disk_io_t *io, unsigned char *buf, size_t n, uint64_t off,
+                             const char *operation, const char *action, int log, unsigned char *badmap);
+static int log_event(const char *operation, uint64_t lba, const char *status, const char *action);
+/*
+ * Writes zeros over a block whose full write failed: physical sector by physical sector,
+ * then logical sector by logical sector inside a physical sector that fails. Every LBA that
+ * cannot be written is reported and logged; the rest of the disk is still erased.
+ * Returns the number of unwritable logical sectors, or UINT64_MAX if logging fails.
+ */
+static uint64_t zero_sectors(disk_io_t *io, const unsigned char *zeros, size_t n, uint64_t off) {
+    uint64_t bad = 0;
+    const size_t ss = log_sector_size, ps = phys_sector_size;
+    for (size_t p = 0; p < n; p += ps) {
+        size_t plen = n - p < ps ? n - p : ps;
+        if (dio_pwrite(io, zeros, plen, off + p) == 0) continue;
+        int perr = errno;
+        for (size_t s = p; s < p + plen; s += ss) {
+            int err = perr;
+            if (plen > ss) {
+                if (dio_pwrite(io, zeros, ss, off + s) == 0) continue;
+                err = errno;
+            }
+            bad++;
+            worker_add_bad();
+            fprintf(stderr, "Unwritable sector: LBA %" PRIu64 " (%s)\n", (off + s) / ss, strerror(err));
+            if (log_event("zero", (off + s) / ss, "DEFECTIVE: write failed", "NONE") < 0) return UINT64_MAX;
+        }
+    }
+    return bad;
+}
+
+/*
+ * Zero-fill then full read-back. Neither a write error nor a verification error stops the
+ * operation: the faulty LBAs are located, reported and logged, and the operation fails at
+ * the end, so that the rest of the disk is erased and checked anyway.
+ */
 static int zero_disk(int fd, uint64_t size) {
     disk_io_t io; dio_open(&io, fd, 1);
     unsigned char *buf = alloc_aligned(BUF_SIZE), *verify = alloc_aligned(BUF_SIZE);
+    uint64_t unwritable = 0, unreadable = 0, not_zero = 0;
     int rc = -1;
     if (!buf || !verify) { perror("aligned allocation"); goto out; }
     memset(buf, 0, BUF_SIZE);
@@ -623,7 +660,10 @@ static int zero_disk(int fd, uint64_t size) {
     for (uint64_t off = 0; off < size;) {
         size_t n = (size - off > BUF_SIZE) ? BUF_SIZE : (size_t)(size - off);
         if (dio_pwrite(&io, buf, n, off) < 0) {
-            fprintf(stderr, "\nWrite failed at 0x%" PRIx64 ": %s\n", off, strerror(errno)); goto out;
+            fprintf(stderr, "\nWrite error in the block at 0x%" PRIx64 " (%s); writing sector by sector…\n", off, strerror(errno));
+            uint64_t b = zero_sectors(&io, buf, n, off);
+            if (b == UINT64_MAX) goto out;
+            unwritable += b;
         }
         off += n;
         if ((off % (16ULL * 1024 * 1024) < BUF_SIZE) || off == size)
@@ -636,14 +676,30 @@ static int zero_disk(int fd, uint64_t size) {
     for (uint64_t off = 0; off < size;) {
         size_t n = (size - off > BUF_SIZE) ? BUF_SIZE : (size_t)(size - off);
         if (dio_pread(&io, verify, n, off) < 0) {
-            fprintf(stderr, "\nRead-back failed at 0x%" PRIx64 ": %s\n", off, strerror(errno)); goto out;
+            fprintf(stderr, "\nRead-back error in the block at 0x%" PRIx64 " (%s); checking sector by sector…\n", off, strerror(errno));
+            /* Unreadable sectors come back as zeros in verify: only the readable ones are compared below. */
+            uint64_t b = read_sectors(&io, verify, n, off, "zero-verify", "NONE", 1, NULL);
+            if (b == UINT64_MAX) goto out;
+            unreadable += b;
         }
-        for (size_t i = 0; i < n; i++) if (verify[i] != 0) {
-            fprintf(stderr, "\nVerification failed: non-zero data at 0x%" PRIx64 "\n", off + i); goto out;
+        if (memcmp(verify, buf, n) != 0) {
+            for (size_t s = 0; s < n; s += log_sector_size) {
+                if (!memcmp(verify + s, buf, log_sector_size)) continue;
+                uint64_t lba = (off + s) / log_sector_size;
+                not_zero++;
+                worker_add_bad();
+                fprintf(stderr, "\nVerification failed: non-zero data at LBA %" PRIu64 "\n", lba);
+                if (log_event("zero-verify", lba, "DEFECTIVE: not zero after write", "NONE") < 0) goto out;
+            }
         }
         off += n;
         if ((off % (16ULL * 1024 * 1024) < BUF_SIZE) || off == size)
             progress_show(&progress, "Verification", off, size);
+    }
+    if (unwritable || unreadable || not_zero) {
+        fprintf(stderr, "\nZero-fill complete with errors: %" PRIu64 " unwritable, %" PRIu64 " unreadable and %"
+                PRIu64 " non-zero sector(s).\n", unwritable, unreadable, not_zero);
+        goto out;
     }
     fprintf(stderr, "\nZero-fill + verification complete.\n");
     rc = 0;
@@ -2200,6 +2256,47 @@ static int timed_pread(disk_io_t *io, void *buf, size_t n, uint64_t off, double 
  */
 #define BLOCK_MIN_EXCESS_MS 5.0
 
+/*
+ * Local reference: a hard disk reads its outer tracks (start of the disk) about twice as fast
+ * as its inner tracks (end of the disk). The threshold is therefore based on the median of the
+ * surrounding 1 GiB region, bounded to [0.5, 1.5] x the global median so that a damaged
+ * region covering most of its region cannot raise its own threshold.
+ */
+#define LOCAL_BLOCKS 1024U
+#define LOCAL_MIN_SAMPLES 256U
+static double *local_medians(const float *pass1, uint64_t total, double global, size_t *count) {
+    size_t n = (size_t)((total + LOCAL_BLOCKS - 1) / LOCAL_BLOCKS);
+    double *med = malloc(n * sizeof(*med)), v[LOCAL_BLOCKS];
+    if (!med) return NULL;
+    for (size_t t = 0; t < n; t++) {
+        size_t nv = 0;
+        for (uint64_t i = (uint64_t)t * LOCAL_BLOCKS; i < total && i < (uint64_t)(t + 1) * LOCAL_BLOCKS; i++)
+            if (pass1[i] >= 0) v[nv++] = pass1[i];
+        double m = nv >= LOCAL_MIN_SAMPLES ? median_of(v, nv) : global;
+        if (m < 0.5 * global) m = 0.5 * global;
+        if (m > 1.5 * global) m = 1.5 * global;
+        med[t] = m;
+    }
+    *count = n;
+    return med;
+}
+/* Slowness threshold of a block: median x factor, at least BLOCK_MIN_EXCESS_MS above the median. */
+static double block_threshold(double median, double factor) {
+    double t = median * factor;
+    return t < median + BLOCK_MIN_EXCESS_MS ? median + BLOCK_MIN_EXCESS_MS : t;
+}
+static int slow_push(slow_block_t **slow, size_t *n, size_t *cap, const slow_block_t *b) {
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 16;
+        if (nc < *cap || nc > SIZE_MAX / sizeof(**slow)) return -1;
+        slow_block_t *p = realloc(*slow, nc * sizeof(*p));
+        if (!p) return -1;
+        *slow = p; *cap = nc;
+    }
+    (*slow)[(*n)++] = *b;
+    return 0;
+}
+
 /* Slow zone located inside a 1 MiB block. */
 typedef struct {
     size_t block;           /* index in the list of reported blocks */
@@ -2279,9 +2376,11 @@ static void fmt_ms(char *out, size_t n, double ms) {
 
 /*
  * Slow-block scan (and repair if repair is set):
- *   1. pass 1: time of each 1 MiB block, median and threshold = median × factor;
- *   2. pass 2: a block is confirmed only if it exceeds the threshold on both passes
- *      (the whole disk is read in between, so its cache cannot skew the measurement);
+ *   1. pass 1: time of each 1 MiB block; threshold = local median (1 GiB region) × factor;
+ *   2. pass 2: only the blocks that were slow or unreadable on pass 1 are read again, each
+ *      after flushing the disk's cache (the whole disk is read again when there are too many
+ *      of them, or without the pass 1 times); a block is confirmed only if it exceeds the
+ *      threshold on both passes;
  *   3. location: each confirmed block is measured again in 64 KiB zones, compared to
  *      a reference taken on healthy blocks (3rd measurement: if the slowness does not
  *      reproduce, nothing is rewritten); when repairing, only slow zones are rewritten;
@@ -2304,6 +2403,7 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
     unsigned char *buf = alloc_aligned(BUF_SIZE), *tmp = alloc_aligned(BUF_SIZE);
     double *sample = malloc(sample_cap * sizeof(*sample));
     float *pass1 = total <= SIZE_MAX / sizeof(float) ? malloc((size_t)total * sizeof(float)) : NULL;
+    double *local = NULL;
     slow_block_t *slow = NULL;
     zone_t *zones = NULL;
     size_t nslow = 0, cap = 0, nzones = 0, zcap = 0;
@@ -2352,23 +2452,51 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
     fprintf(stderr, "\n");
     if (!nsample) { fprintf(stderr, "No successful read.\n"); goto out; }
     double median = median_of(sample, nsample);
-    double threshold = median * factor;
-    int floor_used = threshold < median + BLOCK_MIN_EXCESS_MS;
-    if (floor_used) threshold = median + BLOCK_MIN_EXCESS_MS;
     free(sample); sample = NULL;
-    if (floor_used)
+    size_t nlocal = 0;
+    local = pass1 ? local_medians(pass1, total, median, &nlocal) : NULL;
+    if (pass1 && !local) fprintf(stderr, "Warning: not enough memory for local medians; using the global median.\n");
+    double threshold = block_threshold(median, factor);
+    if (local && nlocal > 1) {
+        double lo = local[0], hi = local[0];
+        for (size_t t = 1; t < nlocal; t++) { if (local[t] < lo) lo = local[t]; if (local[t] > hi) hi = local[t]; }
+        printf("Median reference: %.3f ms/block (per-GiB local medians: %.3f to %.3f ms); "
+               "threshold: local median × %.2f, at least +%.0f ms.\n", median, lo, hi, factor, BLOCK_MIN_EXCESS_MS);
+    } else if (threshold > median * factor)
         printf("Median reference: %.3f ms/block; threshold: %.3f ms (fast media: minimum gap of %.0f ms).\n",
                median, threshold, BLOCK_MIN_EXCESS_MS);
     else printf("Median reference: %.3f ms/block; threshold: %.3f ms (factor %.2f).\n", median, threshold, factor);
 
-    /* Pass 2: confirmation. */
-    fprintf(stderr, "Pass 2/2: confirming slow blocks…\n");
-    progress_begin(&progress, "Pass 2/2: confirmation", size);
-    for (uint64_t i = 0; i < total; i++) {
+    /*
+     * Pass 2: confirmation. With the pass 1 times, only the candidates (slow or unreadable on
+     * pass 1) are read again, each after flushing the disk's cache. When there are so many
+     * candidates that these flushes would cost more than reading the whole disk, or without
+     * the pass 1 times, the whole disk is read again sequentially, as before.
+     */
+    uint64_t ncand1 = 0;
+    if (pass1)
+        for (uint64_t i = 0; i < total; i++)
+            ncand1 += pass1[i] < 0 || (double)pass1[i] > block_threshold(local ? local[i / LOCAL_BLOCKS] : median, factor);
+    const uint64_t evict_cost = (EVICT_BYTES < size / 4 ? EVICT_BYTES : size / 4) + BUF_SIZE;
+    const int targeted = pass1 && ncand1 <= size / evict_cost;
+    const uint64_t npass2 = targeted ? ncand1 : total;
+    if (targeted) fprintf(stderr, "Pass 2/2: confirming %" PRIu64 " candidate block(s)…\n", ncand1);
+    else fprintf(stderr, "Pass 2/2: confirming slow blocks (whole disk)…\n");
+    progress_begin(&progress, "Pass 2/2: confirmation", npass2 * BUF_SIZE);
+    uint64_t done2 = 0;
+    for (uint64_t i = 0; i < total && npass2; i++) {
+        double med_i = local ? local[i / LOCAL_BLOCKS] : median, thr_i = block_threshold(med_i, factor);
+        int failed1 = pass1 && pass1[i] < 0;
+        int slow1 = pass1 && !failed1 && (double)pass1[i] > thr_i;
+        if (targeted && !failed1 && !slow1) continue;
         uint64_t off = i * (uint64_t)BUF_SIZE;
         size_t n = (size - off > BUF_SIZE) ? BUF_SIZE : (size_t)(size - off);
+        if (targeted) {
+            /* Isolated re-read: flush the disk's cache, then position the head just after the block. */
+            evict_drive_cache(&io, tmp, size, off);
+            if (off + n + log_sector_size <= size) (void)dio_pread(&io, tmp, log_sector_size, off + n);
+        }
         double ms;
-        int failed1 = pass1 && pass1[i] < 0;
         if (timed_pread(&io, buf, n, off, &ms) < 0) {
             ms = -1.0;
             if (!failed1) {   /* new error: locate and log it (already done on pass 1 otherwise) */
@@ -2379,22 +2507,19 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
                 bad_sectors += bad;
             }
         }
-        if (ms < 0 || ms > threshold || failed1) {
-            if (nslow == cap) {
-                size_t nc = cap ? cap * 2 : 16;
-                if (nc < cap || nc > SIZE_MAX / sizeof(*slow)) { fprintf(stderr, "Slow block list too large.\n"); goto out; }
-                slow_block_t *p = realloc(slow, nc * sizeof(*p));
-                if (!p) { perror("realloc"); goto out; }
-                slow = p; cap = nc;
-            }
+        int slow2 = ms > thr_i;
+        if (ms < 0 || slow2 || failed1 || slow1) {
             double ms1 = pass1 ? (double)pass1[i] : -2.0;
             int status = ms < 0 ? SB_UNREADABLE : failed1 ? SB_TRANSIENT
-                       : (!pass1 || ms1 < 0 || ms1 > threshold) ? SB_CONFIRMED : SB_INTERMITTENT;
-            slow[nslow++] = (slow_block_t){.index = i, .ms = ms, .ms1 = ms1, .status = status};
+                       : (slow2 && (!pass1 || slow1)) ? SB_CONFIRMED : SB_INTERMITTENT;
+            slow_block_t sb = {.index = i, .ms = ms, .ms1 = ms1, .med = med_i, .status = status};
+            if (slow_push(&slow, &nslow, &cap, &sb) < 0) { fprintf(stderr, "Slow block list: out of memory.\n"); goto out; }
         }
-        if ((i + 1) % 16 == 0 || i + 1 == total)
-            progress_show(&progress, "Pass 2/2: confirmation", (i + 1 == total) ? size : (i + 1) * (uint64_t)BUF_SIZE, size);
+        done2++;
+        if (targeted || done2 % 16 == 0 || i + 1 == total)
+            progress_show(&progress, "Pass 2/2: confirmation", done2 * BUF_SIZE, npass2 * BUF_SIZE);
     }
+    free(local); local = NULL;
     fprintf(stderr, "\n");
 
     /* Location (and targeted rewrite) inside confirmed blocks. */
@@ -2431,7 +2556,7 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
         }
         double base = ref;
         if (base <= 0) { double v[ZONES_PER_BLOCK]; memcpy(v, zt, nz * sizeof(*v)); base = median_of(v, nz); }
-        double excess = slow[k].ms - median, sum = 0;
+        double excess = slow[k].ms - slow[k].med, sum = 0;
         size_t first = nzones;
         for (size_t z = 0; z < nz; z++) {
             sum += zt[z];
@@ -2600,7 +2725,7 @@ static int slow_scan(int fd, uint64_t size, double factor, int repair) {
                z_ok, z_still, z_fail, u_fixed, u_fail, zeroed, n_inter);
     rc = repair ? ((z_fail || u_fail || n_trans) ? -1 : 0) : (errors ? -1 : 0);
 out:
-    free(zones); free(slow); free(pass1); free(sample); free(buf); free(tmp); dio_close(&io); return rc;
+    free(zones); free(slow); free(local); free(pass1); free(sample); free(buf); free(tmp); dio_close(&io); return rc;
 }
 
 #define MAX_DISKS 256
@@ -3258,7 +3383,7 @@ static int tui_menu(int fd, uint64_t size, const char *dev) {
             else if((claim=claim_device(dev))<0) ret=-1;
             else if((print_target_disk(dev,size,op_label(c-'0')),!confirm_mutation())) { fprintf(stderr,"Confirmation declined.\n"); }
             else if(c=='4') { tui_open_csv(dev); ret=slow_scan(fd,size,4.0,1); close_log(); if(log_failed) ret=-1; }
-            else if(c=='5') ret=zero_disk(fd,size);
+            else if(c=='5') { tui_open_csv(dev); ret=zero_disk(fd,size); close_log(); if(log_failed) ret=-1; }
             else if(c=='6') ret=secure_erase_any(fd,size);
             else if(c=='7') ret=trim_disk(fd,size);
             if(claim>=0) close(claim);
@@ -3825,7 +3950,7 @@ select_disks:
         j->op = disk_op[i];
         snprintf(j->dev, sizeof(j->dev), "/dev/%.255s", tui_disks[i].name);
         snprintf(j->log, sizeof(j->log), "%s/%.255s.log", logdir, tui_disks[i].name);
-        if (j->op >= 2 && j->op <= 4) snprintf(j->csv, sizeof(j->csv), "%s/%.255s.csv", logdir, tui_disks[i].name);
+        if (j->op >= 2 && j->op <= 5) snprintf(j->csv, sizeof(j->csv), "%s/%.255s.csv", logdir, tui_disks[i].name);
     }
 
     struct timespec t0;

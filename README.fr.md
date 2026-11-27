@@ -75,8 +75,8 @@ Téléchargez l'archive et `SHA256SUMS` depuis la page [Releases](../../releases
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing   # facultatif : contrôle d'intégrité
-tar -xzf diskmedic-1.14.0-linux-x86_64.tar.gz
-cd diskmedic-1.14.0-linux-x86_64
+tar -xzf diskmedic-1.15.0-linux-x86_64.tar.gz
+cd diskmedic-1.15.0-linux-x86_64
 sudo ./diskmedic --help
 ```
 
@@ -127,7 +127,7 @@ Une seule opération est acceptée par invocation.
 | `--verify` | Lecture intégrale, sans écriture |
 | `--scan-slow` (alias `--slow-scan`) | Recherche des blocs anormalement lents (lecture seule) |
 | `--slow-factor N` | Seuil de lenteur = médiane × N (défaut : 4, minimum : 1) |
-| `--log FICHIER` | Journal CSV des secteurs défectueux ou lents (`--verify`, `--scan-slow`, `--slow-repair`) |
+| `--log FICHIER` | Journal CSV des secteurs défectueux ou lents (`--verify`, `--scan-slow`, `--slow-repair`, `--zero`) |
 | `--slow-repair` | Scan, puis réécriture des seules zones lentes confirmées (destructif) |
 | `--zero` | Écrit des zéros sur tout le disque, puis relit pour vérifier (destructif ; refusé sur SSD) |
 | `--trim` | TRIM du disque entier par tranches de 1 Gio, puis relecture d'échantillons (destructif) |
@@ -173,7 +173,7 @@ Les disques sélectionnés sont **traités en parallèle**, un processus par dis
 
 ```
 ╔════════════════════════════════════════════════════════════════════════════════════════╗
-║DiskMedic 1.14.0 · Slow scan · 3 disk(s) in parallel                            00:00:26║
+║DiskMedic 1.15.0 · Slow scan · 3 disk(s) in parallel                            00:00:26║
 ╠════════════════════════════════════════════════════════════════════════════════════════╣
 ║> /dev/sde · scsi_debug · 209.7 MB                                    RUNNING · 00:00:26║
 ║  Step: Pass 1/2: timing                                                  unreadable: 10║
@@ -249,11 +249,17 @@ Il indique aussi la capacité, le format de secteur et le type de support (SSD o
 
 ### Algorithme du scan de blocs lents
 
-1. **Passage 1, mesure** : chaque bloc de 1 Mio est chronométré. La médiane est calculée sur un échantillon de 1 million de mesures au plus, et le seuil vaut médiane × `--slow-factor`, avec un écart minimal de 5 ms au-dessus de la médiane. Sans ce plancher, sur un support très rapide (NVMe, médiane inférieure à 1 ms), les pauses ordinaires du système suffiraient à dépasser le seuil. Une relecture sur disque dur coûte au moins un tour de plateau (8 à 11 ms) et reste détectée.
-2. **Passage 2, confirmation** : un bloc n'est retenu que s'il dépasse le seuil aux deux passages. Un bloc lent à un seul passage est classé *intermittent* et n'est jamais réécrit. Une erreur de lecture est localisée secteur par secteur dès qu'elle survient, au passage 1 ou 2 ; un bloc en erreur au passage 1 et lisible au passage 2 est signalé comme *erreur de lecture passagère*.
+1. **Passage 1, mesure** : chaque bloc de 1 Mio est chronométré. Le seuil vaut la médiane *locale* × `--slow-factor`, avec un écart minimal de 5 ms au-dessus de cette médiane. La médiane locale est calculée sur chaque région de 1 Gio, car un disque dur lit ses pistes extérieures (début du disque) environ deux fois plus vite que ses pistes intérieures (fin du disque) ; elle reste comprise entre 0,5 et 1,5 × la médiane globale (calculée sur un échantillon de 1 million de mesures au plus), pour qu'une zone abîmée qui couvre la majeure partie de sa région ne relève pas son propre seuil. Sans ce plancher, sur un support très rapide (NVMe, médiane inférieure à 1 ms), les pauses ordinaires du système suffiraient à dépasser le seuil. Une relecture sur disque dur coûte au moins un tour de plateau (8 à 11 ms) et reste détectée.
+2. **Passage 2, confirmation** : seuls les blocs lents ou illisibles au passage 1 sont relus, chacun après la lecture de 64 Mio ailleurs pour vider le cache du disque. Cela prend quelques secondes au lieu d'une seconde lecture complète du disque. Quand les candidats sont si nombreux que ces vidages coûteraient plus qu'une lecture complète, tout le disque est relu à la place. Un bloc n'est retenu que s'il dépasse le seuil aux deux passages. Un bloc lent à un seul passage est classé *intermittent* et n'est jamais réécrit. Une erreur de lecture est localisée secteur par secteur dès qu'elle survient, au passage 1 ou 2 ; un bloc en erreur au passage 1 et lisible au passage 2 est signalé comme *erreur de lecture passagère*.
 3. **Localisation** : chaque bloc confirmé est relu par zones de 64 Kio, ou de la taille du secteur physique si elle est plus grande, de la dernière zone à la première. Avant cela, 64 Mio sont lus ailleurs sur le disque pour vider son cache. Chaque zone est comparée à une zone saine de référence : elle est lente si elle porte au moins la moitié du retard du bloc, ou si elle dépasse le facteur × la référence avec au moins 1 ms d'écart.
 4. **Réécriture ciblée** (`--slow-repair`) : seules les zones lentes sont réécrites, avec leurs propres données, puis relues et comparées. Dans un bloc illisible, seuls les secteurs physiques qui contiennent un secteur perdu sont réécrits ; la partie perdue est remplacée par des zéros, ce qui permet au firmware de réallouer le secteur.
 5. **Contrôle différé** : chaque zone réécrite est rechronométrée après un nouveau vidage du cache, puis classée `FAST` ou `STILL SLOW`.
+
+### Remplissage de zéros (`--zero`)
+
+1. **Écriture** : les zéros sont écrits par blocs de 1 Mio en `O_DIRECT`. Si un bloc ne peut pas être écrit, il est réécrit secteur physique par secteur physique, puis secteur logique par secteur logique dans un secteur physique qui échoue encore. Chaque LBA impossible à écrire est signalée et journalisée (`zero`, `DEFECTIVE: write failed`), et l'effacement continue : le reste du disque est effacé quand même.
+2. **Relecture** : après une synchronisation, tout le disque est relu. Un bloc illisible est localisé secteur par secteur (`zero-verify`, `DEFECTIVE: read failed`), et chaque secteur qui ne se relit pas à zéro est journalisé (`DEFECTIVE: not zero after write`).
+3. **Résultat** : l'opération échoue (code de sortie `1`) si au moins un secteur n'a pas pu être écrit, relu ou mis à zéro, avec un résumé des trois compteurs.
 
 ### Exécution parallèle
 
@@ -291,7 +297,7 @@ Les tests n'utilisent **jamais de disque réel**, seulement des fichiers, des lo
 | Commande | Droits | Contenu |
 |---|---|---|
 | `make test` | utilisateur | Options, codes de sortie, rendu SMART sur données fabriquées (HDD/SSD SATA, NVMe, SAS), décodage SAT, absence de couleurs hors terminal, largeur ≤ 80 colonnes |
-| `sudo sh tests/run_loop_tests.sh` | root | Vérification, scan, réparation, écriture zéro et refus d'un disque monté, sur loop device. Secteurs illisibles simulés par `dm-error` et `dm-flakey`, secteurs lents par `dm-delay`, et une erreur de lecture passagère (la table en erreur est remplacée par une table saine entre les deux passages). Vérifie le journal CSV ligne par ligne |
+| `sudo sh tests/run_loop_tests.sh` | root | Vérification, scan, réparation, écriture zéro et refus d'un disque monté, sur loop device. Secteurs illisibles simulés par `dm-error` et `dm-flakey` (dont une écriture zéro qui continue après des secteurs impossibles à écrire), secteurs lents par `dm-delay`, et une erreur de lecture passagère (la table en erreur est remplacée par une table saine entre les deux passages). Vérifie le journal CSV ligne par ligne |
 | `sudo sh tests/run_sector_tests.sh` | root | Mêmes opérations en 512n, 512e et 4Kn avec `scsi_debug`, qui se présente comme un SSD : refus de `--zero` et `--slow-repair` sans `--force`, TRIM refusé sans UNMAP puis réussi avec. Vérifie aussi le LBA exact signalé, qu'un seul secteur physique est réécrit, le nombre de lectures en échec, le menu multi-disques piloté au clavier dans un pseudo-terminal (dont le choix TRIM sur SSD), le journal CSV du menu d'un seul disque, et un disque qui annonce une défaillance (mode test activé avec `sdparm`) : code de sortie `4` et `[CRITICAL]` dans le résumé |
 | `sudo sh tests/run_nvme_tests.sh` | root | **nvme-loop** (cible NVMe du noyau, sans Format ni Sanitize) : SMART, refus de `--zero`, refus de Secure Erase avant confirmation, TRIM. **QEMU** (machine virtuelle de quelques secondes, avec trois contrôleurs NVMe émulés) : Format NVM réellement exécuté sur des secteurs de 512 o et de 4 Kio (format conservé), et sur un contrôleur à deux namespaces (l'autre namespace reste intact) |
 

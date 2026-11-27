@@ -74,8 +74,8 @@ Download the archive and `SHA256SUMS` from the [Releases](../../releases/latest)
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing   # optional: integrity check
-tar -xzf diskmedic-1.14.0-linux-x86_64.tar.gz
-cd diskmedic-1.14.0-linux-x86_64
+tar -xzf diskmedic-1.15.0-linux-x86_64.tar.gz
+cd diskmedic-1.15.0-linux-x86_64
 sudo ./diskmedic --help
 ```
 
@@ -126,7 +126,7 @@ Only one operation is accepted per run.
 | `--verify` | Full read, without writing |
 | `--scan-slow` (alias `--slow-scan`) | Looks for abnormally slow blocks (read-only) |
 | `--slow-factor N` | Slowness threshold = median × N (default: 4, minimum: 1) |
-| `--log FILE` | CSV log of bad or slow sectors (`--verify`, `--scan-slow`, `--slow-repair`) |
+| `--log FILE` | CSV log of bad or slow sectors (`--verify`, `--scan-slow`, `--slow-repair`, `--zero`) |
 | `--slow-repair` | Scan, then rewrite the confirmed slow zones only (destructive) |
 | `--zero` | Writes zeros over the whole disk, then reads back to verify (destructive; refused on SSD) |
 | `--trim` | TRIM of the whole disk in 1 GiB chunks, then reads back samples (destructive) |
@@ -172,7 +172,7 @@ The selected disks are **processed in parallel**, one process per disk, and foll
 
 ```
 ╔════════════════════════════════════════════════════════════════════════════════════════╗
-║DiskMedic 1.14.0 · Slow scan · 3 disk(s) in parallel                            00:00:26║
+║DiskMedic 1.15.0 · Slow scan · 3 disk(s) in parallel                            00:00:26║
 ╠════════════════════════════════════════════════════════════════════════════════════════╣
 ║> /dev/sde · scsi_debug · 209.7 MB                                    RUNNING · 00:00:26║
 ║  Step: Pass 1/2: timing                                                  unreadable: 10║
@@ -248,11 +248,17 @@ It also shows the capacity, the sector format and the media type (SSD or hard di
 
 ### Slow-block scan algorithm
 
-1. **Pass 1, timing**: each 1 MiB block is timed. The median is computed over a sample of at most 1 million measurements, and the threshold is median × `--slow-factor`, with a minimum gap of 5 ms above the median. Without this floor, on very fast media (NVMe, median below 1 ms), ordinary system pauses would be enough to exceed the threshold. A re-read on a hard disk costs at least one platter revolution (8 to 11 ms), so it is still detected.
-2. **Pass 2, confirmation**: a block is kept only if it exceeds the threshold on both passes. A block that is slow on one pass only is classified as *intermittent* and is never rewritten. A read error is located sector by sector as soon as it occurs, on pass 1 or 2; a block that fails on pass 1 and reads fine on pass 2 is reported as a *transient read error*.
+1. **Pass 1, timing**: each 1 MiB block is timed. The threshold is the *local* median × `--slow-factor`, with a minimum gap of 5 ms above that median. The local median is computed over each 1 GiB region, because a hard disk reads its outer tracks (start of the disk) about twice as fast as its inner tracks (end of the disk); it is kept between 0.5 and 1.5 × the global median (computed over a sample of at most 1 million measurements), so that a damaged area covering most of its region cannot raise its own threshold. Without this floor, on very fast media (NVMe, median below 1 ms), ordinary system pauses would be enough to exceed the threshold. A re-read on a hard disk costs at least one platter revolution (8 to 11 ms), so it is still detected.
+2. **Pass 2, confirmation**: only the blocks that were slow or unreadable on pass 1 are read again, each one after reading 64 MiB elsewhere to flush the disk's cache. This takes seconds instead of a second full read of the disk. When there are so many candidates that these flushes would cost more than a full read, the whole disk is read again instead. A block is kept only if it exceeds the threshold on both passes. A block that is slow on one pass only is classified as *intermittent* and is never rewritten. A read error is located sector by sector as soon as it occurs, on pass 1 or 2; a block that fails on pass 1 and reads fine on pass 2 is reported as a *transient read error*.
 3. **Location**: each confirmed block is read again in 64 KiB zones (or zones of the physical sector size, if larger), from the last zone to the first. Beforehand, 64 MiB are read elsewhere on the disk to flush its cache. Each zone is compared to a healthy reference zone: a zone is slow if it carries at least half of the block's delay, or if it exceeds the factor × the reference with a gap of at least 1 ms.
 4. **Targeted rewrite** (`--slow-repair`): only the slow zones are rewritten, with their own data, then read back and compared. In an unreadable block, only the physical sectors that contain a lost sector are rewritten; the lost part is replaced with zeros, which lets the firmware reallocate the sector.
 5. **Deferred check**: each rewritten zone is timed again after another cache flush, then classified as `FAST` or `STILL SLOW`.
+
+### Zero-fill (`--zero`)
+
+1. **Writing**: zeros are written in 1 MiB blocks with `O_DIRECT`. If a block cannot be written, it is written again physical sector by physical sector, then logical sector by logical sector inside a physical sector that still fails. Each unwritable LBA is reported and logged (`zero`, `DEFECTIVE: write failed`), and the erase goes on: the rest of the disk is erased anyway.
+2. **Read-back**: after a sync, the whole disk is read back. An unreadable block is located sector by sector (`zero-verify`, `DEFECTIVE: read failed`), and each sector that does not read back as zeros is logged (`DEFECTIVE: not zero after write`).
+3. **Result**: the operation fails (exit code `1`) if at least one sector could not be written, read back or zeroed, with a summary of the three counts.
 
 ### Parallel execution
 
@@ -290,7 +296,7 @@ The tests **never use a real disk**, only files, loop devices, in-memory virtual
 | Command | Privileges | Content |
 |---|---|---|
 | `make test` | user | Options, exit codes, SMART rendering on fabricated data (SATA HDD/SSD, NVMe, SAS), SAT decoding, no colors outside a terminal, width ≤ 80 columns |
-| `sudo sh tests/run_loop_tests.sh` | root | Verification, scan, repair, zero-fill and refusal of a mounted disk, on a loop device. Unreadable sectors simulated with `dm-error` and `dm-flakey`, slow sectors with `dm-delay`, and a transient read error (the error table is swapped for a healthy one between the two passes). Checks the CSV log line by line |
+| `sudo sh tests/run_loop_tests.sh` | root | Verification, scan, repair, zero-fill and refusal of a mounted disk, on a loop device. Unreadable sectors simulated with `dm-error` and `dm-flakey` (including a zero-fill that goes on past unwritable sectors), slow sectors with `dm-delay`, and a transient read error (the error table is swapped for a healthy one between the two passes). Checks the CSV log line by line |
 | `sudo sh tests/run_sector_tests.sh` | root | The same operations in 512n, 512e and 4Kn with `scsi_debug`, which presents itself as an SSD: `--zero` and `--slow-repair` refused without `--force`, TRIM refused without UNMAP and then successful with it. Also checks the exact LBA reported, that a single physical sector is rewritten, the number of failed reads, and the keyboard-driven multi-disk menu in a pseudo-terminal (including the TRIM choice for SSDs), the CSV log of the single-disk menu, and a disk that predicts a failure (test mode enabled with `sdparm`): exit code `4` and `[CRITICAL]` in the summary |
 | `sudo sh tests/run_nvme_tests.sh` | root | **nvme-loop** (the kernel's NVMe target, without Format or Sanitize): SMART, `--zero` refused, Secure Erase refused before confirmation, TRIM. **QEMU** (a virtual machine that boots in a few seconds, with three emulated NVMe controllers): Format NVM actually run on 512 B and 4 KiB sectors (format kept), and on a controller with two namespaces (the other namespace stays intact) |
 
