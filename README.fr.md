@@ -75,8 +75,8 @@ Téléchargez l'archive et `SHA256SUMS` depuis la page [Releases](../../releases
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing   # facultatif : contrôle d'intégrité
-tar -xzf diskmedic-1.12.0-linux-x86_64.tar.gz
-cd diskmedic-1.12.0-linux-x86_64
+tar -xzf diskmedic-1.13.0-linux-x86_64.tar.gz
+cd diskmedic-1.13.0-linux-x86_64
 sudo ./diskmedic --help
 ```
 
@@ -134,6 +134,7 @@ Une seule opération est acceptée par invocation.
 | `--secure-erase` | ATA Security Erase (mode *enhanced* si proposé), ou NVMe Sanitize / Format NVM (destructif) |
 | `--force` | Avec `--zero` ou `--slow-repair` : lance l'opération même sur un SSD |
 | `--tui` | Menu interactif ; sans périphérique, sélection de plusieurs disques |
+| `--no-color` | Sans couleurs (la variable d'environnement `NO_COLOR` fait de même) |
 | `--help`, `-h` / `--version` | Aide / version |
 
 **Codes de sortie**
@@ -158,11 +159,15 @@ Une seule opération est acceptée par invocation.
 
 | Touche | Action |
 |---|---|
-| ↑ / ↓ | Se déplacer |
+| ↑ / ↓ (ou `k` / `j`), Page préc. / suiv., Début / Fin | Se déplacer |
 | Espace | Sélectionner ou désélectionner un disque |
 | `a` | Tout sélectionner ou tout désélectionner |
 | Entrée | Valider, puis choisir l'opération (1 à 7, 7 = TRIM) |
 | `q` | Quitter |
+
+Chaque ligne indique le modèle, la capacité et le type du disque (HDD, SSD, NVMe). Un disque marqué **IN USE** est monté ou utilisé (swap, LVM, RAID…) : seules les opérations en lecture y seront lancées. **SYSTEM** désigne le disque qui porte le système de fichiers racine.
+
+Pendant le choix de l'opération, les disques sélectionnés restent affichés avec leur numéro de série, leur capacité et leur type. Ils sont listés à nouveau avant une opération destructive.
 
 Les disques sélectionnés sont **traités en parallèle**, un processus par disque, et suivis sur un tableau de bord plein écran :
 
@@ -197,6 +202,7 @@ Si la fenêtre est petite, l'affichage passe à deux lignes par disque.
 - **Journaux** : un dossier `diskmedic-AAAAMMJJ-HHMMSS/` est créé dans le dossier courant (ou dans `/tmp`). Il contient un `sdX.log` par disque, plus un `sdX.csv` pour la vérification et le scan. Sous `sudo`, les fichiers sont attribués à l'utilisateur appelant.
 - **Fin** : le terminal normal affiche le rapport de chaque disque, puis un résumé `[OK]` / `[FAILED]` / `[INTERRUPTED]`. Pour SMART, un disque dont le verdict n'est pas sain apparaît en `[WARNING]`, `[CRITICAL]` ou `[UNKNOWN]`, et le tableau de bord le compte comme alerte SMART.
 - **Sécurité** : avant une opération destructive, la liste des disques visés s'affiche, avec l'opération prévue pour chacun. Si un seul d'entre eux est monté ou utilisé, rien n'est lancé.
+- **Terminal** : l'écran est redessiné quand la fenêtre change de taille. Si le programme est arrêté (Ctrl+C dans le menu d'un seul disque, `kill`), le terminal est restauré. Sans locale UTF-8, les cadres et les barres sont dessinés en ASCII.
 - **SSD dans la sélection** : pour une écriture zéro, DiskMedic liste les SSD et propose `t` (TRIM sur les SSD, zéros sur les disques durs), `z` (zéros partout) ou l'annulation. Pour une réparation lente, il propose `s` (scan seul sur les SSD), `r` (réparer partout) ou l'annulation.
 
 Avec `--tui /dev/sdX`, le menu porte sur un seul disque. Son en-tête affiche la fiche du disque, quel que soit son type :

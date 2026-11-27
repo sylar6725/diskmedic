@@ -277,7 +277,7 @@ if command -v script >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
     }
     keys_single | (cd "$T/par" && timeout -k 5 300 script -qfec "stty rows 30 cols 90; $BIN --tui $DEV" /dev/null) >"$T/ts" 2>&1 || true
     cp "$T/ts" "$T/err"
-    grep -aq 'Operation finished (code 0)' "$T/ts" || fail "verification from the single-disk menu did not succeed"
+    grep -aq 'Operation finished: OK (code 0)' "$T/ts" || fail "verification from the single-disk menu did not succeed"
     CSV=$(ls "$T"/par/diskmedic-*/"${DEV#/dev/}.csv" 2>/dev/null | head -1)
     [ -n "$CSV" ] || fail "no CSV log created by the single-disk menu"
     head -1 "$CSV" | grep -q '^timestamp_iso8601,device,operation,LBA,status,action$' || fail "CSV log header missing"
