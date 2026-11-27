@@ -75,8 +75,8 @@ Téléchargez l'archive et `SHA256SUMS` depuis la page [Releases](../../releases
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing   # facultatif : contrôle d'intégrité
-tar -xzf diskmedic-1.13.0-linux-x86_64.tar.gz
-cd diskmedic-1.13.0-linux-x86_64
+tar -xzf diskmedic-1.14.0-linux-x86_64.tar.gz
+cd diskmedic-1.14.0-linux-x86_64
 sudo ./diskmedic --help
 ```
 
@@ -162,7 +162,7 @@ Une seule opération est acceptée par invocation.
 | ↑ / ↓ (ou `k` / `j`), Page préc. / suiv., Début / Fin | Se déplacer |
 | Espace | Sélectionner ou désélectionner un disque |
 | `a` | Tout sélectionner ou tout désélectionner |
-| Entrée | Valider, puis choisir l'opération (1 à 7, 7 = TRIM) |
+| Entrée | Valider, puis choisir l'opération : ↑/↓ + Entrée, ou directement 1 à 7 (7 = TRIM) ; `q` revient à la sélection |
 | `q` | Quitter |
 
 Chaque ligne indique le modèle, la capacité et le type du disque (HDD, SSD, NVMe). Un disque marqué **IN USE** est monté ou utilisé (swap, LVM, RAID…) : seules les opérations en lecture y seront lancées. **SYSTEM** désigne le disque qui porte le système de fichiers racine.
@@ -198,10 +198,11 @@ Pour chaque disque, le tableau de bord montre :
 
 Si la fenêtre est petite, l'affichage passe à deux lignes par disque.
 
+- **Suivre un disque** : ↑/↓ choisit un disque, Entrée affiche son journal en plein écran et le tient à jour pendant que les opérations continuent ; `q`, Échap ou Entrée revient au tableau de bord. La ligne du bas donne aussi le temps restant pour le disque le plus lent.
 - **Interruption** : `q` ou Ctrl+C, puis `y` pour confirmer. Le résumé indique l'étape et le pourcentage atteints par chaque disque. Un Secure Erase ne peut pas être interrompu, car c'est le firmware du disque qui l'exécute.
 - **Journaux** : un dossier `diskmedic-AAAAMMJJ-HHMMSS/` est créé dans le dossier courant (ou dans `/tmp`). Il contient un `sdX.log` par disque, plus un `sdX.csv` pour la vérification et le scan. Sous `sudo`, les fichiers sont attribués à l'utilisateur appelant.
-- **Fin** : le terminal normal affiche le rapport de chaque disque, puis un résumé `[OK]` / `[FAILED]` / `[INTERRUPTED]`. Pour SMART, un disque dont le verdict n'est pas sain apparaît en `[WARNING]`, `[CRITICAL]` ou `[UNKNOWN]`, et le tableau de bord le compte comme alerte SMART.
-- **Sécurité** : avant une opération destructive, la liste des disques visés s'affiche, avec l'opération prévue pour chacun. Si un seul d'entre eux est monté ou utilisé, rien n'est lancé.
+- **Fin** : le terminal normal affiche d'abord un résumé `[OK]` / `[FAILED]` / `[INTERRUPTED]`, puis le rapport de chaque disque, puis un récapitulatif sur une ligne. Pour SMART, un disque dont le verdict n'est pas sain apparaît en `[WARNING]`, `[CRITICAL]` ou `[UNKNOWN]`, et le tableau de bord le compte comme alerte SMART.
+- **Sécurité** : avant une opération destructive, la liste des disques visés s'affiche en rouge, avec le modèle, le numéro de série, la capacité et l'opération prévue pour chacun. Si un seul d'entre eux est monté ou utilisé, rien n'est lancé.
 - **Terminal** : l'écran est redessiné quand la fenêtre change de taille. Si le programme est arrêté (Ctrl+C dans le menu d'un seul disque, `kill`), le terminal est restauré. Sans locale UTF-8, les cadres et les barres sont dessinés en ASCII.
 - **SSD dans la sélection** : pour une écriture zéro, DiskMedic liste les SSD et propose `t` (TRIM sur les SSD, zéros sur les disques durs), `z` (zéros partout) ou l'annulation. Pour une réparation lente, il propose `s` (scan seul sur les SSD), `r` (réparer partout) ou l'annulation.
 
@@ -211,7 +212,7 @@ Avec `--tui /dev/sdX`, le menu porte sur un seul disque. Son en-tête affiche la
 - NVMe : santé, température, vie restante ;
 - SAS : avis du firmware, température.
 
-Il indique aussi la capacité, le format de secteur et le type de support (SSD ou disque dur). Sur un SSD, les choix 4 et 5 proposent l'alternative adaptée (scan seul, TRIM) ou l'opération quand même. La vérification, le scan lent et la réparation écrivent leur journal CSV dans un nouveau dossier `diskmedic-AAAAMMJJ-HHMMSS/`, comme en mode multi-disques.
+Il indique aussi la capacité, le format de secteur et le type de support (SSD ou disque dur). Les opérations sont listées une par ligne avec une courte description : on se déplace avec ↑/↓ puis Entrée, ou on tape directement 1 à 7. Une opération que le disque ne peut pas faire (Secure Erase en SAS ou derrière une passerelle USB) est grisée, avec la raison. Le rapport SMART s'ouvre dans une visionneuse que l'on fait défiler (↑/↓, Page préc./suiv., `q` pour fermer). Avant une opération destructive, le modèle, le numéro de série et la capacité du disque sont rappelés. Sur un SSD, les choix 4 et 5 proposent l'alternative adaptée (scan seul, TRIM) ou l'opération quand même. La vérification, le scan lent et la réparation écrivent leur journal CSV dans un nouveau dossier `diskmedic-AAAAMMJJ-HHMMSS/`, comme en mode multi-disques.
 
 ## Détails techniques
 
