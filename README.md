@@ -172,7 +172,7 @@ The selected disks are **processed in parallel**, one process per disk, and foll
 
 ```
 ╔════════════════════════════════════════════════════════════════════════════════════════╗
-║DiskMedic 1.14.0 · Slow scan · 3 disk(s) in parallel                            00:00:26║
+║DiskMedic 1.15.0 · Slow scan · 3 disk(s) in parallel                            00:00:26║
 ╠════════════════════════════════════════════════════════════════════════════════════════╣
 ║> /dev/sde · scsi_debug · 209.7 MB                                    RUNNING · 00:00:26║
 ║  Step: Pass 1/2: timing                                                  unreadable: 10║
